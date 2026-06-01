@@ -1,0 +1,1 @@
+# Simulador CAC + Financiamiento — DoctoRed
