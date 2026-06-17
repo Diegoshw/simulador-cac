@@ -1,0 +1,1899 @@
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Simulador CAC + Financiamiento — DoctoRed</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.7/Recharts.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script><style>body{margin:0}</style></head><body><div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect } = React;
+const { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine, ComposedChart, Area } = Recharts;
+// ============================================================================
+// MÓDULO SEGUIMIENTO — escenario de lanzamiento + carga de reales + desvíos
+// Insertado en paridad en SimuladorCAC.jsx y simulador-cac.html.
+// ============================================================================
+
+// --- Capa de datos (backend) -------------------------------------------------
+// SHEETS_URL: URL del Web App de Google Apps Script. Vacío => persiste local.
+const SHEETS_URL = "";
+const SEG_LS_KEY = "simuladorcac_seguimiento_v1";
+
+const segStore = {
+  async load() {
+    if (SHEETS_URL) {
+      try {
+        const r = await fetch(SHEETS_URL + "?action=load", { redirect: "follow" });
+        const j = await r.json();
+        if (j && j.ok && j.data) {
+          try { localStorage.setItem(SEG_LS_KEY, JSON.stringify(j.data)); } catch (e) {}
+          return j.data;
+        }
+      } catch (e) { /* cae a local */ }
+    }
+    try { const s = localStorage.getItem(SEG_LS_KEY); return s ? JSON.parse(s) : null; }
+    catch (e) { return null; }
+  },
+  async save(state) {
+    try { localStorage.setItem(SEG_LS_KEY, JSON.stringify(state)); } catch (e) {}
+    if (SHEETS_URL) {
+      try {
+        await fetch(SHEETS_URL, {
+          method: "POST",
+          headers: { "Content-Type": "text/plain;charset=utf-8" },
+          body: JSON.stringify({ action: "save", data: state }),
+        });
+        return "remoto";
+      } catch (e) { return "local"; }
+    }
+    return "local";
+  },
+};
+
+// --- Helpers de fechas y ventas ---------------------------------------------
+function segAddMonths(ym, n) {
+  // ym = "YYYY-MM"; devuelve "YYYY-MM" + n meses
+  if (!ym) return "";
+  const [y, m] = ym.split("-").map(Number);
+  const d = new Date(y, (m - 1) + n, 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function segMesLabel(fechaInicio, mes) {
+  const ym = segAddMonths(fechaInicio, mes - 1);
+  if (!ym) return `Mes ${mes}`;
+  const [y, m] = ym.split("-");
+  const meses = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+  return `${meses[+m - 1]} ${y.slice(2)}`;
+}
+function segVentasForecastMes(p, mes) {
+  let broker = 0;
+  if (mes >= 1 && mes <= 12) broker = p.ventasY1[mes - 1];
+  else if (mes > 12) broker = p.ventasY2plus;
+  return broker + (p.ventasOS || 0);
+}
+
+// --- Definición de líneas comparables ---------------------------------------
+// dir: "alto_mejor" (caja, stock, ingresos) | "bajo_mejor" (costos, deuda) | "neutro"
+const SEG_LINEAS = [
+  { key: "ventas",           label: "Ventas (cápitas)",   tipo: "capitas", dir: "alto_mejor" },
+  { key: "ingresos",         label: "Recaudación",        tipo: "money",   dir: "alto_mejor" },
+  { key: "costoPrestacional",label: "Prestacional",       tipo: "money",   dir: "bajo_mejor" },
+  { key: "pagoBroker",       label: "Pago broker",        tipo: "money",   dir: "bajo_mejor" },
+  { key: "marketing",        label: "Marketing",          tipo: "money",   dir: "bajo_mejor" },
+  { key: "cuotasPrestamos",  label: "Cuotas préstamos",   tipo: "money",   dir: "bajo_mejor" },
+  { key: "nuevoPrestamo",    label: "Nuevo préstamo",     tipo: "money",   dir: "bajo_mejor" },
+  { key: "retiro",           label: "Retiro socios",      tipo: "money",   dir: "neutro" },
+  { key: "saldoCaja",        label: "Caja",               tipo: "money",   dir: "alto_mejor" },
+  { key: "deudaVigente",     label: "Deuda vigente",      tipo: "money",   dir: "bajo_mejor" },
+  { key: "stockCapitas",     label: "Stock cápitas",      tipo: "capitas", dir: "alto_mejor" },
+];
+
+function segFmtVal(v, tipo) {
+  if (v === null || v === undefined || v === "") return "—";
+  if (tipo === "money") return `$${Number(v).toLocaleString("es-AR")}M`;
+  return Number(v).toLocaleString("es-AR");
+}
+function segSemaforo(pctAbs) {
+  if (pctAbs <= 5) return "bg-emerald-500";
+  if (pctAbs <= 15) return "bg-amber-500";
+  return "bg-rose-500";
+}
+
+function PanelSeguimiento({ simulacion, params, fmtM, fmtPesos }) {
+  const [estado, setEstado] = useState({ escenario: null, reales: {} });
+  const [cargando, setCargando] = useState(true);
+  const [estadoGuardado, setEstadoGuardado] = useState("");
+  const [mesSel, setMesSel] = useState(1);
+  const [fechaInicio, setFechaInicio] = useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  });
+  const [borrador, setBorrador] = useState({});
+
+  useEffect(() => {
+    let vivo = true;
+    segStore.load().then((s) => {
+      if (!vivo) return;
+      if (s && s.escenario) setEstado({ escenario: s.escenario, reales: s.reales || {} });
+      setCargando(false);
+    });
+    return () => { vivo = false; };
+  }, []);
+
+  const persist = (next) => {
+    setEstado(next);
+    setEstadoGuardado("Guardando…");
+    segStore.save(next).then((modo) => {
+      setEstadoGuardado(modo === "remoto" ? "Guardado en Sheets ✓" : "Guardado local ✓");
+      setTimeout(() => setEstadoGuardado(""), 2500);
+    });
+  };
+
+  const iniciarProyecto = () => {
+    const forecast = simulacion.data.map((d) => ({
+      mes: d.mes,
+      ventas: segVentasForecastMes(params, d.mes),
+      ingresos: d.ingresos,
+      costoPrestacional: d.costoPrestacional,
+      pagoBroker: d.pagoBroker,
+      marketing: d.marketing,
+      cuotasPrestamos: d.cuotasPrestamos,
+      nuevoPrestamo: d.nuevoPrestamo,
+      retiro: d.retiro,
+      saldoCaja: d.saldoCaja,
+      deudaVigente: d.deudaVigente,
+      stockCapitas: d.stockCapitas,
+      altasMes: d.altasMes,
+      bajasMes: d.bajasMes,
+    }));
+    const escenario = {
+      nombre: "Escenario de lanzamiento",
+      fechaInicio,
+      createdAt: new Date().toISOString(),
+      params: JSON.parse(JSON.stringify(params)),
+      forecast,
+      kpis: {
+        payback: simulacion.mesPaybackFin,
+        autosuficiencia: simulacion.mesAutosuficiencia,
+        deudaMaxima: simulacion.deudaMaxima,
+        ratioLtvCac: simulacion.ratioLtvCac,
+        valorizacion: simulacion.valorizacionCartera,
+      },
+    };
+    persist({ escenario, reales: {} });
+  };
+
+  const resetEscenario = () => {
+    if (typeof window !== "undefined" && !window.confirm("Esto borra el escenario de lanzamiento y TODOS los reales cargados. ¿Continuar?")) return;
+    persist({ escenario: null, reales: {} });
+  };
+
+  const fcDe = (mes) => (estado.escenario ? estado.escenario.forecast.find((f) => f.mes === mes) : null);
+
+  const abrirMes = (mes) => {
+    setMesSel(mes);
+    const r = estado.reales[mes] || {};
+    setBorrador({ ...r });
+  };
+
+  const guardarMes = () => {
+    const limpio = {};
+    SEG_LINEAS.forEach((l) => {
+      const v = borrador[l.key];
+      if (v !== "" && v !== null && v !== undefined && !Number.isNaN(Number(v))) limpio[l.key] = Number(v);
+    });
+    if (borrador.notas) limpio.notas = borrador.notas;
+    const reales = { ...estado.reales, [mesSel]: limpio };
+    persist({ ...estado, reales });
+  };
+
+  const borrarMes = (mes) => {
+    const reales = { ...estado.reales };
+    delete reales[mes];
+    persist({ ...estado, reales });
+  };
+
+  const exportarJSON = () => {
+    const blob = new Blob([JSON.stringify(estado, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `seguimiento-cac-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+  const importarJSON = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const j = JSON.parse(reader.result);
+        if (j && j.escenario) persist({ escenario: j.escenario, reales: j.reales || {} });
+      } catch (err) { if (typeof window !== "undefined") window.alert("Archivo inválido"); }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  if (cargando) {
+    return <div className="bg-white rounded-xl shadow-sm p-8 border border-slate-200 text-center text-slate-500">Cargando seguimiento…</div>;
+  }
+
+  // ---- Sin escenario: pantalla de inicio ----
+  if (!estado.escenario) {
+    return (
+      <div className="max-w-2xl mx-auto">
+        <div className="bg-white rounded-2xl shadow-sm p-8 border border-slate-200">
+          <h2 className="text-2xl font-bold text-slate-900 mb-2">Iniciar proyecto</h2>
+          <p className="text-slate-600 mb-6 leading-relaxed">
+            Vas a congelar la simulación actual como <strong>escenario de lanzamiento</strong> (el forecast contra el que vas a comparar los resultados reales mes a mes). Ajustá los parámetros en la pestaña <strong>Simulador</strong> hasta que reflejen tu plan, elegí el mes de arranque y congelalo.
+          </p>
+          <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 mb-6">
+            <div className="grid grid-cols-2 gap-3 text-sm">
+              <div><span className="text-slate-500">Payback forecast:</span> <strong className="text-slate-800">{simulacion.mesPaybackFin ? `mes ${simulacion.mesPaybackFin}` : "—"}</strong></div>
+              <div><span className="text-slate-500">Autosuficiencia:</span> <strong className="text-slate-800">{simulacion.mesAutosuficiencia ? `mes ${simulacion.mesAutosuficiencia}` : "—"}</strong></div>
+              <div><span className="text-slate-500">Deuda máxima:</span> <strong className="text-slate-800">{fmtM(simulacion.deudaMaxima)}</strong></div>
+              <div><span className="text-slate-500">LTV/CAC:</span> <strong className="text-slate-800">{simulacion.ratioLtvCac.toFixed(1)}x</strong></div>
+            </div>
+          </div>
+          <label className="block text-sm font-semibold text-slate-700 mb-1">Mes de arranque (mes 1)</label>
+          <input type="month" value={fechaInicio} onChange={(e) => setFechaInicio(e.target.value)} className="border border-slate-300 rounded-lg px-3 py-2 mb-6 w-48" />
+          <div className="flex items-center gap-3">
+            <button onClick={iniciarProyecto} className="bg-emerald-600 hover:bg-emerald-700 text-white font-semibold px-5 py-2.5 rounded-lg transition">Congelar escenario de lanzamiento</button>
+            <label className="text-sm text-slate-500 cursor-pointer hover:text-slate-700">
+              o importar JSON
+              <input type="file" accept="application/json" onChange={importarJSON} className="hidden" />
+            </label>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ---- Con escenario: tablero ----
+  const esc = estado.escenario;
+  const horizonte = esc.forecast.length;
+  const fcMes = fcDe(mesSel);
+  const mesesConReales = Object.keys(estado.reales).map(Number).sort((a, b) => a - b);
+
+  const chartData = esc.forecast.map((f) => {
+    const r = estado.reales[f.mes] || {};
+    const tiene = (k) => (r[k] === undefined || r[k] === null ? null : r[k]);
+    return {
+      mes: f.mes,
+      label: segMesLabel(esc.fechaInicio, f.mes),
+      deudaF: f.deudaVigente, deudaR: tiene("deudaVigente"),
+      cajaF: f.saldoCaja, cajaR: tiene("saldoCaja"),
+      stockF: f.stockCapitas, stockR: tiene("stockCapitas"),
+      recF: f.ingresos, recR: tiene("ingresos"),
+    };
+  });
+
+  // Desvío acumulado de caja al último mes real cargado
+  let kpiDesvioCaja = null, kpiDesvioDeuda = null, ultimoMesReal = null;
+  if (mesesConReales.length) {
+    ultimoMesReal = mesesConReales[mesesConReales.length - 1];
+    const r = estado.reales[ultimoMesReal];
+    const f = fcDe(ultimoMesReal);
+    if (r && f) {
+      if (r.saldoCaja !== undefined) kpiDesvioCaja = r.saldoCaja - f.saldoCaja;
+      if (r.deudaVigente !== undefined) kpiDesvioDeuda = r.deudaVigente - f.deudaVigente;
+    }
+  }
+
+  const ChartCmp = ({ titulo, fKey, rKey, color }) => (
+    <div className="bg-white rounded-xl shadow-sm p-4 border border-slate-200">
+      <h4 className="text-sm font-semibold text-slate-700 mb-2">{titulo}</h4>
+      <ResponsiveContainer width="100%" height={220}>
+        <LineChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+          <XAxis dataKey="label" tick={{ fontSize: 10 }} interval={Math.ceil(horizonte / 12)} />
+          <YAxis tick={{ fontSize: 10 }} />
+          <Tooltip />
+          <Legend wrapperStyle={{ fontSize: 11 }} />
+          <Line type="monotone" dataKey={fKey} name="Forecast" stroke="#94a3b8" strokeWidth={2} strokeDasharray="5 4" dot={false} />
+          <Line type="monotone" dataKey={rKey} name="Real" stroke={color} strokeWidth={2.5} dot={{ r: 2 }} connectNulls />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+
+  return (
+    <div className="space-y-6">
+      {/* Encabezado del escenario */}
+      <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200 flex items-center justify-between flex-wrap gap-3">
+        <div>
+          <h2 className="text-xl font-bold text-slate-900">{esc.nombre}</h2>
+          <p className="text-sm text-slate-500">Arranque {segMesLabel(esc.fechaInicio, 1)} · horizonte {horizonte} meses · congelado {new Date(esc.createdAt).toLocaleDateString("es-AR")}</p>
+        </div>
+        <div className="flex items-center gap-2">
+          {estadoGuardado && <span className="text-xs text-emerald-600 font-medium">{estadoGuardado}</span>}
+          <span className={`text-xs px-2 py-1 rounded-md font-semibold ${SHEETS_URL ? "bg-emerald-100 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>{SHEETS_URL ? "Sheets" : "Local"}</span>
+          <button onClick={exportarJSON} className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-md font-medium transition">Exportar</button>
+          <label className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-md font-medium transition cursor-pointer">Importar<input type="file" accept="application/json" onChange={importarJSON} className="hidden" /></label>
+          <button onClick={resetEscenario} className="text-xs bg-rose-50 hover:bg-rose-100 text-rose-600 px-3 py-1.5 rounded-md font-medium transition">Reset</button>
+        </div>
+      </div>
+
+      {/* KPIs de desvío */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="bg-white rounded-xl shadow-sm p-4 border border-slate-200">
+          <p className="text-[11px] text-slate-500 uppercase tracking-wide">Meses con reales</p>
+          <p className="text-2xl font-bold text-slate-800">{mesesConReales.length}<span className="text-sm font-normal text-slate-400"> / {horizonte}</span></p>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm p-4 border border-slate-200">
+          <p className="text-[11px] text-slate-500 uppercase tracking-wide">Desvío caja {ultimoMesReal ? `(${segMesLabel(esc.fechaInicio, ultimoMesReal)})` : ""}</p>
+          <p className={`text-2xl font-bold ${kpiDesvioCaja === null ? "text-slate-300" : kpiDesvioCaja >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{kpiDesvioCaja === null ? "—" : `${kpiDesvioCaja >= 0 ? "+" : ""}$${kpiDesvioCaja.toLocaleString("es-AR")}M`}</p>
+        </div>
+        <div className="bg-white rounded-xl shadow-sm p-4 border border-slate-200">
+          <p className="text-[11px] text-slate-500 uppercase tracking-wide">Desvío deuda {ultimoMesReal ? `(${segMesLabel(esc.fechaInicio, ultimoMesReal)})` : ""}</p>
+          <p className={`text-2xl font-bold ${kpiDesvioDeuda === null ? "text-slate-300" : kpiDesvioDeuda <= 0 ? "text-emerald-600" : "text-rose-600"}`}>{kpiDesvioDeuda === null ? "—" : `${kpiDesvioDeuda >= 0 ? "+" : ""}$${kpiDesvioDeuda.toLocaleString("es-AR")}M`}</p>
+        </div>
+      </div>
+
+      {/* Carga mensual */}
+      <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+        <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+          <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide">Carga de reales</h3>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-slate-500">Mes</label>
+            <select value={mesSel} onChange={(e) => abrirMes(Number(e.target.value))} className="border border-slate-300 rounded-lg px-3 py-1.5 text-sm">
+              {esc.forecast.map((f) => (
+                <option key={f.mes} value={f.mes}>{`Mes ${f.mes} · ${segMesLabel(esc.fechaInicio, f.mes)}${estado.reales[f.mes] ? " ✓" : ""}`}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+          {SEG_LINEAS.map((l) => {
+            const fcv = fcMes ? fcMes[l.key] : null;
+            return (
+              <div key={l.key} className="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                <label className="text-[11px] font-semibold text-slate-600 block mb-1">{l.label}</label>
+                <input
+                  type="number"
+                  value={borrador[l.key] === undefined ? "" : borrador[l.key]}
+                  onChange={(e) => setBorrador({ ...borrador, [l.key]: e.target.value })}
+                  placeholder={fcv !== null && fcv !== undefined ? `fc ${fcv}` : ""}
+                  className="w-full border border-slate-300 rounded-md px-2 py-1 text-sm"
+                />
+                <p className="text-[10px] text-slate-400 mt-1">Forecast: {segFmtVal(fcv, l.tipo)}</p>
+              </div>
+            );
+          })}
+          <div className="bg-slate-50 rounded-lg p-3 border border-slate-200 col-span-2">
+            <label className="text-[11px] font-semibold text-slate-600 block mb-1">Notas del mes</label>
+            <input type="text" value={borrador.notas || ""} onChange={(e) => setBorrador({ ...borrador, notas: e.target.value })} className="w-full border border-slate-300 rounded-md px-2 py-1 text-sm" />
+          </div>
+        </div>
+        <div className="flex items-center gap-3 mt-4">
+          <button onClick={guardarMes} className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-semibold px-4 py-2 rounded-lg transition">Guardar mes {mesSel}</button>
+          {estado.reales[mesSel] && <button onClick={() => borrarMes(mesSel)} className="text-sm text-rose-600 hover:text-rose-700">Borrar reales de este mes</button>}
+          <span className="text-[11px] text-slate-400">Dejá vacío lo que no midas: solo se compara lo cargado.</span>
+        </div>
+      </div>
+
+      {/* Tabla de desvíos */}
+      <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+        <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-4">Desvíos reales vs forecast</h3>
+        {mesesConReales.length === 0 ? (
+          <p className="text-sm text-slate-400">Todavía no cargaste reales. Cargá al menos un mes para ver los desvíos.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-slate-500 border-b border-slate-200">
+                  <th className="text-left py-2 pr-3 sticky left-0 bg-white">Línea</th>
+                  {mesesConReales.map((m) => (
+                    <th key={m} className="text-right py-2 px-3 whitespace-nowrap">{segMesLabel(esc.fechaInicio, m)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {SEG_LINEAS.map((l) => (
+                  <tr key={l.key} className="border-b border-slate-100">
+                    <td className="text-left py-2 pr-3 font-medium text-slate-700 sticky left-0 bg-white">{l.label}</td>
+                    {mesesConReales.map((m) => {
+                      const r = estado.reales[m];
+                      const f = fcDe(m);
+                      const rv = r ? r[l.key] : undefined;
+                      const fv = f ? f[l.key] : undefined;
+                      if (rv === undefined || rv === null) return <td key={m} className="text-right py-2 px-3 text-slate-300">—</td>;
+                      const delta = rv - (fv || 0);
+                      const pct = fv ? (delta / Math.abs(fv)) * 100 : (rv !== 0 ? 100 : 0);
+                      return (
+                        <td key={m} className="text-right py-2 px-3 whitespace-nowrap">
+                          <div className="flex items-center justify-end gap-1.5">
+                            <span className={`inline-block w-2 h-2 rounded-full ${segSemaforo(Math.abs(pct))}`}></span>
+                            <span className="font-semibold text-slate-800">{segFmtVal(rv, l.tipo)}</span>
+                          </div>
+                          <div className={`text-[10px] ${delta >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{delta >= 0 ? "+" : ""}{l.tipo === "money" ? `${delta}M` : delta} ({pct >= 0 ? "+" : ""}{pct.toFixed(0)}%)</div>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p className="text-[11px] text-slate-400 mt-3">Semáforo por magnitud del desvío: <span className="text-emerald-600 font-medium">≤5%</span> · <span className="text-amber-600 font-medium">5–15%</span> · <span className="text-rose-600 font-medium">&gt;15%</span>. El Δ muestra real menos forecast.</p>
+          </div>
+        )}
+      </div>
+
+      {/* Gráficos comparativos */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <ChartCmp titulo="Deuda vigente — real vs forecast" fKey="deudaF" rKey="deudaR" color="#e11d48" />
+        <ChartCmp titulo="Caja — real vs forecast" fKey="cajaF" rKey="cajaR" color="#0d9488" />
+        <ChartCmp titulo="Stock de cápitas — real vs forecast" fKey="stockF" rKey="stockR" color="#2563eb" />
+        <ChartCmp titulo="Recaudación — real vs forecast" fKey="recF" rKey="recR" color="#7c3aed" />
+      </div>
+
+      <p className="text-[11px] text-slate-400 text-center">Fase 1: escenario de lanzamiento + carga de reales + desvíos. La re-proyección (reanclar y re-simular desde el estado real) llega en la Fase 2.</p>
+    </div>
+  );
+}
+
+function SimuladorCAC() {
+  // Ventas mes a mes del primer año (curva de crecimiento) + valor fijo año 2+
+  // ventasMes0: ventas ya realizadas el mes anterior al inicio del análisis (M=0).
+  const [ventasMes0, setVentasMes0] = useState(1750);
+  const [ventasY1, setVentasY1] = useState([1750, 2000, 2250, 2500, 2750, 3000, 3250, 3500, 3750, 4000, 4250, 4500]);
+  const [ventasY2plus, setVentasY2plus] = useState(4500);
+  const [ventasOS, setVentasOS] = useState(0);
+  const [cuotaPromedio, setCuotaPromedio] = useState(65000);
+  const [cacA, setCacA] = useState(4.5);
+  const [cacC, setCacC] = useState(5);
+
+  // Inversión en marketing mensual por tramo (en millones de ARS). Costo operativo mensual.
+  const [mktY1, setMktY1] = useState(0); // Año 1 (meses 1-12)
+  const [mktY2, setMktY2] = useState(0); // Año 2 (meses 13-24)
+  const [mktY3, setMktY3] = useState(0); // Año 3+ (mes 25+)
+
+  // Ventas de broker para un mes de venta dado (k = 1-indexed)
+  const ventasBrokerEn = (k) => {
+    if (k < 0) return 0;
+    if (k === 0) return ventasMes0;
+    if (k <= 12) return ventasY1[k - 1];
+    return ventasY2plus;
+  };
+
+  const [pctModoA, setPctModoA] = useState(60); // % de la adquisición que se paga en Modo A; el resto en C
+  const [cupoChequesPropios, setCupoChequesPropios] = useState(0); // cupo revolvente (M$) de cheques propios para diferir el tramo Modo A a esquema 60/90/120
+
+  // Retiro de socios: monto mensual a partir del mes siguiente al pico de deuda
+  const [retiroEnabled, setRetiroEnabled] = useState(false);
+  const [retiroMensual, setRetiroMensual] = useState(500); // en millones ARS
+
+  const [cmY1H1, setCmY1H1] = useState(50);
+  const [cmY1H2, setCmY1H2] = useState(40);
+  const [cmY2, setCmY2] = useState(65);
+  const [cmY3, setCmY3] = useState(70);
+  const [churnMensual, setChurnMensual] = useState(1.5);
+
+  const [tnaPct, setTnaPct] = useState(35);
+  const PLAZO_PRESTAMO = 12;
+  const tasaMensual = tnaPct / 12;
+
+  const [meses, setMeses] = useState(36);
+
+  // Aguinaldo: % de la cuota de aguinaldo destinada a este proyecto (0-100). 100 = aguinaldo pleno (50% de la cuota cada 6 meses).
+  const [aguinaldoPct, setAguinaldoPct] = useState(100);
+  // IVA broker: % de IVA que queda como costo a financiar (0-21). 21 = IVA pleno, 0 = totalmente recuperable.
+  const [ivaPct, setIvaPct] = useState(21);
+  const IVA_MAX = 21;
+  const [valorizMultiplicador, setValorizMultiplicador] = useState(4);
+  // Cartera preexistente: 40k cápitas maduras (+2 años), sin CAC, churn propio, prestacional Año 3+
+  const [carteraInicialEnabled, setCarteraInicialEnabled] = useState(true);
+  const [carteraInicialCant, setCarteraInicialCant] = useState(40000);
+  const [carteraInicialChurn, setCarteraInicialChurn] = useState(2.5);
+  // Costo prestacional propio de la cartera preexistente (% de la cuota). Distinto del de la cartera nueva.
+  const [carteraInicialPrestPct, setCarteraInicialPrestPct] = useState(85);
+  const [valorizConCartera, setValorizConCartera] = useState(true);
+  const [showDetailTable, setShowDetailTable] = useState(false);
+  const [infoMetrica, setInfoMetrica] = useState(null);
+  const [vista, setVista] = useState("simulador");
+
+  // Flags derivados (compatibilidad con UI que solo consulta si está activo)
+  const aguinaldoEnabled = aguinaldoPct > 0;
+  const ivaBrokerEnabled = ivaPct > 0;
+
+  const todasLasSimulaciones = useMemo(() => {
+    const horizonte = meses;
+    const ivaFactor = 1 + ivaPct / 100;
+
+    const cohortStock = (saleMonth, m, count) => {
+      if (m < saleMonth + 1) return 0;
+      const monthsActive = m - saleMonth - 1;
+      return count * Math.pow(1 - churnMensual / 100, monthsActive);
+    };
+
+    // Cartera preexistente: activa desde el mes 1, churn propio, prestacional fijo Año 3+.
+    // Stock en el mes m (m=1 es el mes inicial, full stock).
+    const carteraInicialStock = (m) => {
+      if (!carteraInicialEnabled || m < 1) return 0;
+      return carteraInicialCant * Math.pow(1 - carteraInicialChurn / 100, m - 1);
+    };
+
+    const getCostoPrestPct = (ageMonths) => {
+      if (ageMonths <= 6) return cmY1H1;
+      if (ageMonths <= 12) return cmY1H2;
+      if (ageMonths <= 24) return cmY2;
+      return cmY3;
+    };
+
+    const cuotaFrancesa = (capital) => {
+      const i = tasaMensual / 100;
+      if (i === 0) return capital / PLAZO_PRESTAMO;
+      return (capital * i) / (1 - Math.pow(1 + i, -PLAZO_PRESTAMO));
+    };
+
+    const isAguinaldoMonth = (mes) => mes % 6 === 1;
+
+    const totalStockByMonth = new Array(horizonte + 1).fill(0);
+    const altasByMonth = new Array(horizonte + 1).fill(0);
+    const bajasByMonth = new Array(horizonte + 1).fill(0);
+    const facturacionGrossByMonth = new Array(horizonte + 1).fill(0);
+    const facturacionBrokerByMonth = new Array(horizonte + 1).fill(0);
+    for (let m = 1; m <= horizonte; m++) {
+      let total = 0;
+      for (let k = 0; k <= m - 1; k++) {
+        total += cohortStock(k, m, ventasBrokerEn(k)) + cohortStock(k, m, ventasOS);
+      }
+      total += carteraInicialStock(m);
+      totalStockByMonth[m] = total;
+      // Altas: en m=1 entra la cartera inicial + la cohorte del mes 0; desde m=2 las ventas normales
+      altasByMonth[m] = (m === 1 ? carteraInicialStock(1) + ventasBrokerEn(0) + ventasOS : 0) + (m >= 2 ? ventasBrokerEn(m - 1) + ventasOS : 0);
+      bajasByMonth[m] = m >= 2 ? totalStockByMonth[m - 1] * (churnMensual / 100) : 0;
+      // Baja propia de la cartera inicial (churn distinto), se suma a las bajas del mes
+      if (m >= 2) bajasByMonth[m] += carteraInicialStock(m - 1) * (carteraInicialChurn / 100);
+      let facturacion = 0;
+      let facturacionBroker = 0;
+      for (let k = 0; k <= m - 2; k++) {
+        const fBroker = cohortStock(k, m - 1, ventasBrokerEn(k)) * cuotaPromedio;
+        facturacion += fBroker + cohortStock(k, m - 1, ventasOS) * cuotaPromedio;
+        facturacionBroker += fBroker;
+      }
+      // Cartera inicial: ya madura, factura/recauda desde el mes 1 (sin desfase de maduración)
+      const fInicial = carteraInicialStock(m) * cuotaPromedio;
+      facturacion += fInicial;
+      facturacionBroker += fInicial;
+      facturacionGrossByMonth[m] = facturacion;
+      facturacionBrokerByMonth[m] = facturacionBroker;
+    }
+
+    const runSim = (pctA, mesPicoDeuda) => {
+      const fracA = pctA / 100;
+      const fracC = 1 - fracA;
+
+      // CUPO DE VALORES PROPIOS A DESCONTAR: el tramo fijado en Modo A (one-shot M+1) se difiere
+      // financieramente a esquema de cheques propios (3 cheques 60/90/120 -> M+3/M+4/M+5, mismo
+      // CAC de Modo A) hasta un cupo REVOLVENTE de cheques abiertos (saldo simultáneo sin cubrir,
+      // medido a valor facial con IVA). Lo que excede el cupo se paga one-shot en M+1 (Modo A puro).
+      // El cupo se libera a medida que los cheques se cobran. Con cupo=0 el comportamiento es idéntico
+      // al Modo A clásico.
+      const cupoFaceVP = cupoChequesPropios * 1_000_000;
+      const pagoANetoByMonth = new Array(horizonte + 8).fill(0);
+      const chequesAbiertosByMonth = new Array(horizonte + 8).fill(0);
+      for (let s = 0; s <= horizonte; s++) {
+        const aMonto = (ventasBrokerEn(s) + ventasOS) * cacA * cuotaPromedio * fracA; // neto Modo A de la cohorte vendida en s
+        const mi = s + 1; // mes de factura del Modo A (M+1)
+        if (aMonto <= 0 || mi > horizonte) continue;
+        const room = Math.max(0, cupoFaceVP - chequesAbiertosByMonth[mi]);
+        const dif = Math.min(aMonto, room / ivaFactor); // neto diferido a cheques propios
+        const face = dif * ivaFactor; // valor facial (con IVA) de los cheques emitidos
+        chequesAbiertosByMonth[mi] += face;          // emisión en M+1: 3 cheques abiertos
+        chequesAbiertosByMonth[mi + 1] += face;      // M+2: aún 3 abiertos
+        chequesAbiertosByMonth[mi + 2] += face * (2 / 3); // M+3: se cobra el de 60 días
+        chequesAbiertosByMonth[mi + 3] += face * (1 / 3); // M+4: se cobra el de 90 días
+        pagoANetoByMonth[mi] += (aMonto - dif);      // remanente one-shot en M+1 (Modo A puro)
+        pagoANetoByMonth[s + 3] += dif / 3;          // cheque 60 días
+        pagoANetoByMonth[s + 4] += dif / 3;          // cheque 90 días
+        pagoANetoByMonth[s + 5] += dif / 3;          // cheque 120 días
+      }
+      let chequesPropiosMaxTracking = 0;
+      for (let mm = 1; mm <= horizonte; mm++) {
+        if (chequesAbiertosByMonth[mm] > chequesPropiosMaxTracking) chequesPropiosMaxTracking = chequesAbiertosByMonth[mm];
+      }
+
+      const data = [];
+      const prestamos = [];
+      let totalInteresesPagados = 0;
+      let totalCapitalSolicitado = 0;
+      let deudaMaximaTracking = 0;
+      let mesPicoDeudaTracking = null;
+      let saldoCaja = 0; // caja acumulada: excedentes que tapan déficits y precancelan deuda
+      let totalRetirado = 0;
+      let totalMarketing = 0;
+
+      for (let m = 1; m <= horizonte; m++) {
+        // INGRESOS BROKER (recaudación regular)
+        let ingresosBroker = 0;
+        for (let k = 0; k <= m - 2; k++) {
+          ingresosBroker += cohortStock(k, m - 1, ventasBrokerEn(k)) * cuotaPromedio;
+        }
+        // Cartera preexistente: recauda su cuota completa desde el mes 1 (ya madura)
+        ingresosBroker += carteraInicialStock(m) * cuotaPromedio;
+
+        // INGRESOS OS RECAUDACIÓN (95% desde edad 6+)
+        let ingresosOSRecaudacion = 0;
+        for (let k = 0; k <= m - 2; k++) {
+          const age = m - k;
+          if (age >= 6) {
+            const stockOS = cohortStock(k, m - 1, ventasOS);
+            ingresosOSRecaudacion += stockOS * cuotaPromedio * 0.95;
+          }
+        }
+
+        // FINANCIACIÓN OS (one-time en mes de venta)
+        const financiacionOS = ventasOS * 4 * cuotaPromedio;
+
+        // AGUINALDO: 50% × (meses activos en últimos 6 / 6), en meses 1, 7, 13, 19...
+        let aguinaldoBroker = 0;
+        let aguinaldoOSRecaudacion = 0;
+        const aguinaldoTasa = 0.5 * (aguinaldoPct / 100);
+        if (aguinaldoEnabled && isAguinaldoMonth(m)) {
+          for (let k = 0; k <= m - 2; k++) {
+            const monthsInWindow = Math.max(0, Math.min(6, m - k - 1));
+            if (monthsInWindow > 0) {
+              const factor = monthsInWindow / 6;
+              const stockBroker = cohortStock(k, m - 1, ventasBrokerEn(k));
+              const stockOS = cohortStock(k, m - 1, ventasOS);
+              const aguinaldoPorCapita = cuotaPromedio * aguinaldoTasa * factor;
+              aguinaldoBroker += stockBroker * aguinaldoPorCapita;
+              const age = m - k;
+              if (age >= 6) {
+                aguinaldoOSRecaudacion += stockOS * aguinaldoPorCapita * 0.95;
+              }
+            }
+          }
+          // Cartera preexistente: madura, aguinaldo con factor completo (50% de la cuota)
+          aguinaldoBroker += carteraInicialStock(m) * cuotaPromedio * aguinaldoTasa;
+        }
+
+        // PRESTACIONAL: el costo de cobertura corre desde que la cápita tiene cobertura
+        // activa (mes M+1 de la venta = m >= k+1), independientemente de cuándo ingresa
+        // la recaudación. Se calcula sobre la cuota teórica de las cápitas con cobertura,
+        // no sobre el ingreso recaudado. NO aplica sobre aguinaldo.
+        let costoPrestacional = 0;
+        let pctEfectivoMes = 0;
+        {
+          let baseTeorica = 0;
+          for (let k = 0; k <= m - 1; k++) {
+            const stockBroker = cohortStock(k, m, ventasBrokerEn(k));
+            const stockOS = cohortStock(k, m, ventasOS);
+            const baseCobertura = (stockBroker + stockOS) * cuotaPromedio;
+            if (baseCobertura <= 0) continue;
+            // Edad en meses de cobertura: M+1 = edad 1
+            const edadCobertura = m - k;
+            const pct = getCostoPrestPct(edadCobertura);
+            costoPrestacional += baseCobertura * (pct / 100);
+            baseTeorica += baseCobertura;
+          }
+          // Cartera preexistente: prestacional fijo en tramo Año 3+ (cmY3) desde el mes 1
+          const baseInicial = carteraInicialStock(m) * cuotaPromedio;
+          if (baseInicial > 0) {
+            costoPrestacional += baseInicial * (carteraInicialPrestPct / 100);
+            baseTeorica += baseInicial;
+          }
+          if (baseTeorica > 0) {
+            pctEfectivoMes = (costoPrestacional / baseTeorica) * 100;
+          }
+        }
+
+        // PAGO BROKER como mezcla de modos A y C (cada cápita se paga fracA en modo A y
+        // fracC en modo C). Regla transversal: la venta del mes M se factura en M+1.
+        //   Componente A: one-shot al facturar  -> M+1  (k=1)
+        //   Componente C: 3 cheques 60/90/120 d  -> M+3..M+5 (k=3..5)
+        // El IVA (21%) sobre el pago al broker se suma como costo de adquisición a financiar.
+        // El mes de venta origen puede ser el mes 0 (m - k >= 0): ventas previas al inicio.
+        const ventasOrigen = (k) => (m - k >= 0 ? ventasBrokerEn(m - k) + ventasOS : 0);
+        // parte A: one-shot remanente en M+1 + cheques propios diferidos (según cupo). Precalculado.
+        let pagoBrokerNeto = pagoANetoByMonth[m] || 0;
+        // parte C
+        for (let k = 3; k <= 5; k++) {
+          pagoBrokerNeto += (ventasOrigen(k) * cacC * cuotaPromedio / 3) * fracC;
+        }
+        const ivaBroker = pagoBrokerNeto * (ivaFactor - 1);
+        const pagoBroker = pagoBrokerNeto + ivaBroker;
+
+        // CUOTAS PRÉSTAMOS
+        let cuotasPrestamos = 0;
+        let interesesMes = 0;
+        prestamos.forEach(p => {
+          const mesesTrans = m - p.mesInicio;
+          if (mesesTrans > 0 && mesesTrans <= PLAZO_PRESTAMO) {
+            cuotasPrestamos += p.cuotaMensual;
+            const interesPeriodo = p.saldoActual * (tasaMensual / 100);
+            const capitalPeriodo = p.cuotaMensual - interesPeriodo;
+            p.saldoActual -= capitalPeriodo;
+            interesesMes += interesPeriodo;
+          }
+        });
+        totalInteresesPagados += interesesMes;
+
+        // INVERSIÓN EN MARKETING: costo operativo mensual, constante dentro de cada tramo.
+        const marketing = (m <= 12 ? mktY1 : m <= 24 ? mktY2 : mktY3) * 1_000_000;
+        totalMarketing += marketing;
+
+        const totalIngresos = ingresosBroker + ingresosOSRecaudacion + financiacionOS + aguinaldoBroker + aguinaldoOSRecaudacion;
+        const flujoOperativo = totalIngresos - costoPrestacional - pagoBroker - cuotasPrestamos - marketing;
+
+        let nuevoPrestamo = 0;
+        let precancelacion = 0;
+        let retiro = 0;
+
+        if (flujoOperativo < 0) {
+          // Déficit: primero se cubre con la caja acumulada, el resto con deuda nueva
+          const deficit = -flujoOperativo;
+          const cubiertoConCaja = Math.min(saldoCaja, deficit);
+          saldoCaja -= cubiertoConCaja;
+          const restante = deficit - cubiertoConCaja;
+          if (restante > 0) {
+            nuevoPrestamo = restante;
+            prestamos.push({
+              mesInicio: m,
+              capital: nuevoPrestamo,
+              saldoActual: nuevoPrestamo,
+              cuotaMensual: cuotaFrancesa(nuevoPrestamo),
+            });
+            totalCapitalSolicitado += nuevoPrestamo;
+          }
+        } else if (flujoOperativo > 0) {
+          let excedente = flujoOperativo;
+
+          // RETIRO DE SOCIOS: a partir del mes siguiente al pico de deuda. Tiene prioridad
+          // sobre la precancelación, pero NUNCA genera deuda: solo se retira lo disponible
+          // (excedente del mes + caja acumulada), hasta el tope mensual configurado.
+          if (retiroEnabled && mesPicoDeuda !== null && m > mesPicoDeuda) {
+            const objetivoRetiro = retiroMensual * 1_000_000;
+            const disponible = excedente + saldoCaja;
+            retiro = Math.min(objetivoRetiro, Math.max(0, disponible));
+            // se descuenta primero del excedente del mes, luego de la caja
+            const deExcedente = Math.min(retiro, excedente);
+            excedente -= deExcedente;
+            saldoCaja -= (retiro - deExcedente);
+            totalRetirado += retiro;
+          }
+
+          // Excedente remanente: precancela deuda viva (capital), priorizando los más antiguos.
+          const vivos = prestamos
+            .filter(p => {
+              const mt = m - p.mesInicio;
+              return mt >= 0 && mt < PLAZO_PRESTAMO && p.saldoActual > 0.01;
+            })
+            .sort((a, b) => a.mesInicio - b.mesInicio);
+          for (const p of vivos) {
+            if (excedente <= 0) break;
+            const pago = Math.min(excedente, p.saldoActual);
+            p.saldoActual -= pago;
+            excedente -= pago;
+            precancelacion += pago;
+            // Recalcular la cuota sobre el saldo remanente y los meses que quedan
+            const mesesRestantes = PLAZO_PRESTAMO - (m - p.mesInicio);
+            if (p.saldoActual > 0.01 && mesesRestantes > 0) {
+              const i = tasaMensual / 100;
+              p.cuotaMensual = i === 0
+                ? p.saldoActual / mesesRestantes
+                : (p.saldoActual * i) / (1 - Math.pow(1 + i, -mesesRestantes));
+            } else {
+              p.cuotaMensual = 0;
+              p.saldoActual = 0;
+            }
+          }
+          saldoCaja += excedente;
+        }
+
+        const flujoNeto = flujoOperativo + nuevoPrestamo - precancelacion - retiro;
+        const deudaVigente = prestamos.reduce((acc, p) => {
+          const mt = m - p.mesInicio;
+          if (mt >= 0 && mt < PLAZO_PRESTAMO) return acc + p.saldoActual;
+          return acc;
+        }, 0);
+        if (deudaVigente > deudaMaximaTracking) { deudaMaximaTracking = deudaVigente; mesPicoDeudaTracking = m; }
+
+        data.push({
+          mes: m,
+          ingresosBroker: Math.round(ingresosBroker / 1_000_000),
+          ingresosOSRecaudacion: Math.round(ingresosOSRecaudacion / 1_000_000),
+          financiacionOS: Math.round(financiacionOS / 1_000_000),
+          aguinaldoBroker: Math.round(aguinaldoBroker / 1_000_000),
+          aguinaldoOSRecaudacion: Math.round(aguinaldoOSRecaudacion / 1_000_000),
+          aguinaldo: Math.round((aguinaldoBroker + aguinaldoOSRecaudacion) / 1_000_000),
+          ingresos: Math.round(totalIngresos / 1_000_000),
+          costoPrestacional: Math.round(costoPrestacional / 1_000_000),
+          marketing: Math.round(marketing / 1_000_000),
+          pagoBroker: Math.round(pagoBroker / 1_000_000),
+          pagoBrokerNeto: Math.round(pagoBrokerNeto / 1_000_000),
+          ivaBroker: Math.round(ivaBroker / 1_000_000),
+          cuotasPrestamos: Math.round(cuotasPrestamos / 1_000_000),
+          interesesMes: Math.round(interesesMes / 1_000_000),
+          flujoOperativo: Math.round(flujoOperativo / 1_000_000),
+          nuevoPrestamo: Math.round(nuevoPrestamo / 1_000_000),
+          precancelacion: Math.round(precancelacion / 1_000_000),
+          retiro: Math.round(retiro / 1_000_000),
+          saldoCaja: Math.round(saldoCaja / 1_000_000),
+          flujoNeto: Math.round(flujoNeto / 1_000_000),
+          deudaVigente: Math.round(deudaVigente / 1_000_000),
+          stockCapitas: Math.round(totalStockByMonth[m]),
+          altasMes: Math.round(altasByMonth[m]),
+          bajasMes: Math.round(bajasByMonth[m]),
+          facturacionGross: Math.round(facturacionGrossByMonth[m] / 1_000_000),
+          facturacionBroker: Math.round(facturacionBrokerByMonth[m] / 1_000_000),
+          facturacionBrokerRaw: facturacionBrokerByMonth[m],
+          pctPrestEfectivo: Math.round(pctEfectivoMes * 10) / 10,
+        });
+      }
+
+      let acumOp = 0;
+      for (let i = 0; i < data.length; i++) {
+        acumOp += data[i].flujoOperativo;
+        data[i].acumuladoOperativo = Math.round(acumOp);
+      }
+      // PAYBACK = último mes en que el acumulado operativo pasa a positivo y se mantiene
+      // positivo hasta el final del horizonte (cruce definitivo). Si el acumulado final
+      // no es positivo, no hay payback dentro del horizonte.
+      let mesPaybackFin = null;
+      if (data[data.length - 1].acumuladoOperativo > 0) {
+        mesPaybackFin = data[0].mes;
+        for (let i = data.length - 1; i >= 0; i--) {
+          if (data[i].acumuladoOperativo <= 0) {
+            mesPaybackFin = i + 1 < data.length ? data[i + 1].mes : null;
+            break;
+          }
+        }
+      }
+
+      let saldoAcum = 0;
+      data.forEach(d => {
+        saldoAcum += d.flujoNeto;
+        d.saldoAcumulado = Math.round(saldoAcum);
+      });
+
+      let mesAutosuficiencia = null;
+      for (let i = 0; i < data.length; i++) {
+        if (data[i].flujoOperativo > 0) {
+          const futurosPos = data.slice(i, Math.min(i + 6, data.length)).every(d => d.flujoOperativo > 0);
+          if (futurosPos || i === data.length - 1) {
+            mesAutosuficiencia = data[i].mes;
+            break;
+          }
+        }
+      }
+
+      // LTV (incluye aguinaldo si está habilitado)
+      let ltv = 0;
+      const horizonteLtv = 120;
+      for (let t = 1; t <= horizonteLtv; t++) {
+        const survival = Math.pow(1 - churnMensual / 100, t - 1);
+        const pctPrest = t <= 6 ? cmY1H1 : t <= 12 ? cmY1H2 : t <= 24 ? cmY2 : cmY3;
+        const margin = 1 - pctPrest / 100;
+        ltv += cuotaPromedio * margin * survival;
+        // Aguinaldo: cada 6 meses de vida del cápita, 50% extra (sin prestacional adicional)
+        if (aguinaldoEnabled && t % 6 === 0) {
+          ltv += cuotaPromedio * 0.5 * (aguinaldoPct / 100) * survival;
+        }
+      }
+      // CAC en pesos (mix): promedio ponderado de los CAC de cada modo según el %.
+      // Incluye IVA del broker si el toggle está activo (costo de adquisición pleno).
+      const cacMix = fracA * cacA + fracC * cacC;
+      const cacEnPesos = cacMix * cuotaPromedio * ivaFactor;
+      let totalAltas = 0;
+      for (let k = 0; k <= horizonte; k++) totalAltas += ventasBrokerEn(k) + ventasOS;
+      const costoFinancieroPorCapita = totalAltas > 0 ? totalInteresesPagados / totalAltas : 0;
+      const cacEfectivo = cacEnPesos + costoFinancieroPorCapita;
+      const ratioLtvCac = ltv / cacEfectivo;
+      const deudaMaxima = deudaMaximaTracking;
+
+      // VALORIZACIÓN DE CARTERA: facturación broker del último mes (sin aguinaldo) × multiplicador
+      const facturacionUltimoMes = facturacionBrokerByMonth[horizonte];
+      const valorizacionCartera = facturacionUltimoMes * valorizMultiplicador;
+      // Desglose: cartera preexistente vs cartera nueva (generada en el horizonte)
+      const facturacionInicialUltimoMes = carteraInicialStock(horizonte) * cuotaPromedio;
+      const valorizacionInicial = facturacionInicialUltimoMes * valorizMultiplicador;
+      const valorizacionNueva = valorizacionCartera - valorizacionInicial;
+
+      return {
+        data,
+        mesAutosuficiencia,
+        mesPaybackFin,
+        cacEfectivo,
+        cacEnPesos,
+        ltv,
+        ratioLtvCac,
+        totalCapitalSolicitado,
+        totalInteresesPagados,
+        deudaMaxima,
+        valorizacionCartera,
+        valorizacionInicial,
+        valorizacionNueva,
+        facturacionUltimoMes,
+        totalRetirado,
+        totalMarketing,
+        mesPicoDeuda: mesPicoDeudaTracking,
+        stockFinal: data[data.length - 1].stockCapitas,
+        chequesPropiosMax: Math.round(chequesPropiosMaxTracking / 1_000_000),
+        acumuladoFinal: data[data.length - 1].acumuladoOperativo,
+      };
+    };
+
+    // Primera pasada: sin aplicar retiro, para detectar el mes del pico de deuda.
+    const pasada1 = runSim(pctModoA, null);
+    // Segunda pasada: aplica el retiro desde el mes siguiente al pico (si está activo).
+    const resultado = runSim(pctModoA, pasada1.mesPicoDeuda);
+    return resultado;
+  }, [ventasMes0, ventasY1, ventasY2plus, ventasOS, cuotaPromedio, cacA, cacC, mktY1, mktY2, mktY3, pctModoA, cupoChequesPropios, cmY1H1, cmY1H2, cmY2, cmY3, churnMensual, tnaPct, tasaMensual, meses, aguinaldoPct, ivaPct, valorizMultiplicador, carteraInicialEnabled, carteraInicialCant, carteraInicialChurn, carteraInicialPrestPct, retiroEnabled, retiroMensual]);
+
+  const simulacion = todasLasSimulaciones;
+
+  const formatMoney = (val) => `$${val.toLocaleString("es-AR")}M`;
+
+  const semaforoPayback = simulacion.mesPaybackFin === null ? "rojo" : simulacion.mesPaybackFin <= 10 ? "verde" : simulacion.mesPaybackFin <= 24 ? "amarillo" : "rojo";
+  const semaforoLtvCac = simulacion.ratioLtvCac > 3 ? "verde" : simulacion.ratioLtvCac > 1.5 ? "amarillo" : "rojo";
+  const colorSemaforo = { verde: "bg-emerald-500", amarillo: "bg-amber-500", rojo: "bg-rose-500" };
+
+  const mixDescripcion = `${pctModoA}% Modo A (one-shot, CAC ${cacA}) + ${100 - pctModoA}% Modo C (3 cheques, CAC ${cacC})`;
+
+  const colorMode = { A: "#0d9488", C: "#f59e0b" };
+
+  // EJEMPLO DE UNA CÁPITA — cálculo dinámico según el mix y parámetros actuales
+  const ejemplo = useMemo(() => {
+    const fracA = pctModoA / 100, fracC = 1 - fracA;
+    const cuota = cuotaPromedio;
+    const pagoNetoA = cacA * cuota * fracA;
+    const pagoNetoC = cacC * cuota * fracC;
+    const pagoNeto = pagoNetoA + pagoNetoC;
+    const iva = pagoNeto * (ivaPct / 100);
+    const pagoConIva = pagoNeto + iva;
+    const ivaF = 1 + ivaPct / 100;
+    // Cronograma combinado: parte A al facturar (M+1), parte C en 3 cheques (M+3..M+5)
+    const cheques = [];
+    if (fracA > 0) cheques.push({ mes: "M+1", desc: "parte A (al facturar)", monto: pagoNetoA * ivaF });
+    if (fracC > 0) {
+      const c = (pagoNetoC * ivaF) / 3;
+      cheques.push({ mes: "M+3", desc: "parte C · 60 días", monto: c });
+      cheques.push({ mes: "M+4", desc: "parte C · 90 días", monto: c });
+      cheques.push({ mes: "M+5", desc: "parte C · 120 días", monto: c });
+    }
+    const cacMix = fracA * cacA + fracC * cacC;
+    const prestacionalMes1 = cuota * (cmY1H1 / 100);
+    return { cac: cacMix, cuota, pagoNeto, iva, pagoConIva, cheques, prestacionalMes1, fracA, fracC, pagoNetoA, pagoNetoC };
+  }, [pctModoA, cacA, cacC, cuotaPromedio, ivaPct, cmY1H1]);
+
+  const fmtPesos = (v) => `$${Math.round(v).toLocaleString("es-AR")}`;
+  const fmtM = (v) => `$${(v / 1_000_000).toFixed(1)}M`;
+
+  const InfoBtn = ({ k }) => (
+    <button
+      onClick={() => setInfoMetrica(k)}
+      className="w-5 h-5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs font-bold inline-flex items-center justify-center transition flex-shrink-0 align-middle ml-1"
+      title="¿Qué es?"
+    >i</button>
+  );
+
+  const explicacionesMetricas = {
+    "Payback": "Último mes en que el flujo operativo acumulado pasa a positivo y se mantiene positivo hasta el final del horizonte. Es el momento a partir del cual el negocio recuperó de forma definitiva toda la inversión, incluyendo los intereses de la deuda. Si el acumulado vuelve a caer en negativo más adelante (por mayores costos o deuda posterior), ese cruce temprano no cuenta: el payback real es el cruce definitivo.",
+    "Autosuficiencia": "Primer mes en que el flujo operativo mensual se vuelve positivo de forma sostenida, sin necesidad de pedir nuevos préstamos. A partir de ahí el negocio se financia solo.",
+    "Deuda máxima": "Stock máximo de deuda con el banco que se alcanza en algún mes del horizonte. Es el pico de exposición financiera: el monto máximo que vas a deber en simultáneo.",
+    "Capital total solicitado": "Suma de todos los préstamos pedidos a lo largo del horizonte para cubrir los déficits mensuales. No es lo que debés en un momento dado, sino el total acumulado solicitado.",
+    "Intereses totales pagados": "Costo financiero total: la suma de todos los intereses pagados por los préstamos tomados durante el horizonte. Es el precio de financiar el modelo a la TNA configurada.",
+    "Acumulado final": "Flujo operativo acumulado al último mes del horizonte. Si es positivo, el negocio generó más caja de la que consumió; si es negativo, todavía no recuperó la inversión.",
+    "LTV / CAC": "Relación entre el valor de vida del cliente (LTV: cuánto deja una cápita en margen durante toda su permanencia) y el costo de adquirirla (CAC, con IVA y costo financiero incluidos). >3x es saludable, 1,5-3x aceptable, <1,5x preocupante.",
+    "Valorización de cartera": "Valor estimado de la cartera: la facturación de broker del último mes (sin aguinaldo) multiplicada por el factor configurable. Es una aproximación al valor de venta o transferencia de la cartera.",
+    "Stock de cápitas activas": "Evolución mes a mes de la cantidad de cápitas activas en la cartera (broker + OS), ya descontadas las bajas por churn. Muestra el crecimiento neto del negocio.",
+    "Altas y bajas mensuales": "Barras verdes: cápitas nuevas incorporadas cada mes (según la curva de ventas). Barras rojas: cápitas perdidas por churn ese mes. La diferencia es el crecimiento neto.",
+    "Ingresos mensuales por cartera": "Lo que entra a ROISA cada mes: recaudación del canal broker (100%), recaudación del canal OS (95%, desde el mes 6) y aguinaldo. No incluye la financiación inicial del canal OS.",
+    "Flujo operativo y financiamiento mensual": "Línea: flujo operativo del mes (ingresos menos prestacional, pago al broker y cuotas de préstamos). Barras: préstamo nuevo tomado ese mes para cubrir el déficit. Cuando la línea cruza a positivo de forma sostenida, se alcanza la autosuficiencia.",
+    "Acumulado operativo (payback real)": "Suma acumulada del flujo operativo mes a mes. Arranca negativo (se invierte) y cuando cruza a positivo significa que se recuperó toda la inversión, incluidos los intereses. Ese cruce es el payback real.",
+    "Composición mensual": "Desglose apilado de ingresos por fuente (broker, OS, aguinaldo, financiación OS) versus egresos (prestacional, pago al broker, cuotas de préstamos) para el modo seleccionado.",
+    "% Prestacional efectivo mensual": "Porcentaje promedio ponderado del costo prestacional sobre la cuota, según la mezcla de edades de las cohortes activas cada mes. Sube a medida que la cartera envejece (los tramos más viejos tienen mayor prestacional).",
+  };
+
+  const paramsActuales = { ventasMes0, ventasY1, ventasY2plus, ventasOS, cuotaPromedio, cacA, cacC, mktY1, mktY2, mktY3, pctModoA, cupoChequesPropios, cmY1H1, cmY1H2, cmY2, cmY3, churnMensual, tnaPct, meses, aguinaldoPct, ivaPct, valorizMultiplicador, carteraInicialEnabled, carteraInicialCant, carteraInicialChurn, carteraInicialPrestPct, retiroEnabled, retiroMensual };
+
+  return (
+    <div className="min-h-screen bg-slate-50 p-6 font-sans">
+      {infoMetrica && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setInfoMetrica(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl max-w-md w-full p-6 relative"
+            onClick={e => e.stopPropagation()}
+          >
+            <button
+              onClick={() => setInfoMetrica(null)}
+              className="absolute top-4 right-4 w-7 h-7 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 flex items-center justify-center transition"
+            >
+              ✕
+            </button>
+            <h3 className="text-lg font-bold text-slate-900 mb-3 pr-8">{infoMetrica}</h3>
+            <p className="text-sm text-slate-600 leading-relaxed">{explicacionesMetricas[infoMetrica]}</p>
+          </div>
+        </div>
+      )}
+      <div className="max-w-7xl mx-auto">
+        <div className="mb-6 flex items-center justify-between flex-wrap gap-3">
+          <div>
+            <h1 className="text-3xl font-bold text-slate-900">Simulador CAC + Financiamiento <span className="text-sm font-normal text-slate-400">v21</span></h1>
+            <p className="text-slate-600 mt-1">DoctoRed — modelo de cohortes con maduración, déficit financiado a {tnaPct}% TNA</p>
+          </div>
+          <div className="flex gap-2">
+            {ventasOS > 0 && (
+              <div className="bg-indigo-100 text-indigo-700 px-3 py-2 rounded-lg text-xs font-semibold">
+                Canal OS: {ventasOS} cápitas/mes
+              </div>
+            )}
+            {aguinaldoEnabled && (
+              <div className="bg-fuchsia-100 text-fuchsia-700 px-3 py-2 rounded-lg text-xs font-semibold">
+                Aguinaldo: {aguinaldoPct}%
+              </div>
+            )}
+            {ivaBrokerEnabled && (
+              <div className="bg-orange-100 text-orange-700 px-3 py-2 rounded-lg text-xs font-semibold">
+                IVA broker: +{ivaPct}%
+              </div>
+            )}
+            {carteraInicialEnabled && (
+              <div className="bg-cyan-100 text-cyan-700 px-3 py-2 rounded-lg text-xs font-semibold">
+                Cartera base: {carteraInicialCant.toLocaleString("es-AR")}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Pestañas */}
+        <div className="flex gap-1 mb-5 border-b border-slate-200">
+          <button onClick={() => setVista("simulador")} className={`px-4 py-2 text-sm font-semibold transition border-b-2 -mb-px ${vista === "simulador" ? "border-teal-600 text-teal-700" : "border-transparent text-slate-500 hover:text-slate-700"}`}>Simulador</button>
+          <button onClick={() => setVista("seguimiento")} className={`px-4 py-2 text-sm font-semibold transition border-b-2 -mb-px ${vista === "seguimiento" ? "border-teal-600 text-teal-700" : "border-transparent text-slate-500 hover:text-slate-700"}`}>Seguimiento</button>
+        </div>
+
+        {vista === "simulador" && (
+        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+          <div className="lg:col-span-1 space-y-4">
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-4">Comerciales</h3>
+
+              <div className="mb-4">
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+                  <label className="text-[11px] font-semibold text-amber-800 flex justify-between">
+                    <span>Mes 0 (ventas previas al inicio)</span>
+                    <span className="text-amber-700 font-bold">{ventasMes0.toLocaleString("es-AR")}</span>
+                  </label>
+                  <input type="range" min="0" max="8000" step="250" value={ventasMes0} onChange={e => setVentasMes0(+e.target.value)} className="w-full mt-1 accent-amber-600" />
+                  <p className="text-[10px] text-amber-700 mt-1 leading-tight">Ventas ya realizadas el mes anterior al análisis. Sus pagos al broker (factura M+1) caen en los primeros meses, por lo que el flujo del mes 1 ya tiene compromisos asumidos: no todo es excedente reservable para el proyecto.</p>
+                </div>
+              </div>
+
+              <div className="mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-medium text-slate-700">Curva de ventas Año 1 (broker)</p>
+                  <span className="text-[10px] text-slate-500">cápitas/mes</span>
+                </div>
+                <div className="space-y-2">
+                  {ventasY1.map((v, i) => (
+                    <div key={i}>
+                      <label className="text-[11px] font-medium text-slate-600 flex justify-between">
+                        <span>Mes {i + 1}</span>
+                        <span className="text-teal-700 font-bold">{v.toLocaleString("es-AR")}</span>
+                      </label>
+                      <input
+                        type="range" min="0" max="8000" step="250" value={v}
+                        onChange={e => {
+                          const next = [...ventasY1];
+                          next[i] = +e.target.value;
+                          setVentasY1(next);
+                        }}
+                        className="w-full accent-teal-600"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mb-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Ventas/mes Año 2+ (fijo)</span>
+                  <span className="text-teal-700 font-bold">{ventasY2plus.toLocaleString("es-AR")}</span>
+                </label>
+                <input type="range" min="0" max="8000" step="250" value={ventasY2plus} onChange={e => setVentasY2plus(+e.target.value)} className="w-full mt-2 accent-teal-700" />
+                <p className="text-[10px] text-slate-500 mt-1 leading-tight">Aplica del mes 13 en adelante.</p>
+              </div>
+
+              <div className="mb-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 bg-indigo-500 rounded-full"></span>
+                    Adquisición vía OS (fijo)
+                  </span>
+                  <span className="text-indigo-700 font-bold">{ventasOS.toLocaleString("es-AR")}</span>
+                </label>
+                <input type="range" min="0" max="3000" step="100" value={ventasOS} onChange={e => setVentasOS(+e.target.value)} className="w-full mt-2 accent-indigo-600" />
+                <p className="text-[10px] text-slate-500 mt-1 leading-tight">Constante todo el horizonte. OS adelanta 4 cuotas/cápita en mes M. Queda con primeras 4 recaudaciones + 5% forever.</p>
+              </div>
+              <div>
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Cuota promedio (ARS)</span>
+                  <span className="text-teal-700 font-bold">${cuotaPromedio.toLocaleString("es-AR")}</span>
+                </label>
+                <input type="range" min="40000" max="120000" step="5000" value={cuotaPromedio} onChange={e => setCuotaPromedio(+e.target.value)} className="w-full mt-2 accent-teal-600" />
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 bg-blue-500 rounded-full"></span>
+                    Multiplicador valorización
+                  </span>
+                  <span className="text-blue-700 font-bold">×{valorizMultiplicador}</span>
+                </label>
+                <input type="range" min="1" max="6" step="1" value={valorizMultiplicador} onChange={e => setValorizMultiplicador(+e.target.value)} className="w-full mt-2 accent-blue-600" />
+                <p className="text-[10px] text-slate-500 mt-1 leading-tight">Valor cartera = facturación broker del último mes × este factor.</p>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200">
+                <label className="flex items-center justify-between cursor-pointer">
+                  <div className="flex-1">
+                    <p className="text-xs font-medium text-slate-700 flex items-center gap-1">
+                      <span className="w-2 h-2 bg-cyan-500 rounded-full"></span>
+                      Cartera preexistente
+                    </p>
+                    <p className="text-[10px] text-slate-500 mt-0.5 leading-tight">Cápitas maduras (+2 años) activas desde el mes 1. Sin CAC, prestacional propio configurable.</p>
+                  </div>
+                  <button
+                    onClick={() => setCarteraInicialEnabled(!carteraInicialEnabled)}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition flex-shrink-0 ${carteraInicialEnabled ? "bg-cyan-600" : "bg-slate-300"}`}
+                  >
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition ${carteraInicialEnabled ? "translate-x-6" : "translate-x-1"}`} />
+                  </button>
+                </label>
+                {carteraInicialEnabled && (
+                  <div className="mt-3 space-y-3">
+                    <div>
+                      <label className="text-xs font-medium text-slate-600 flex justify-between">
+                        <span>Cantidad de cápitas</span>
+                        <span className="text-cyan-700 font-bold">{carteraInicialCant.toLocaleString("es-AR")}</span>
+                      </label>
+                      <input type="range" min="0" max="100000" step="1000" value={carteraInicialCant} onChange={e => setCarteraInicialCant(+e.target.value)} className="w-full mt-1 accent-cyan-600" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-medium text-slate-600 flex justify-between">
+                        <span>Churn mensual (preexistente)</span>
+                        <span className="text-cyan-700 font-bold">{carteraInicialChurn}%</span>
+                      </label>
+                      <input type="range" min="0" max="5" step="0.5" value={carteraInicialChurn} onChange={e => setCarteraInicialChurn(+e.target.value)} className="w-full mt-1 accent-cyan-600" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-medium text-slate-600 flex justify-between">
+                        <span>Costo prestacional (preexistente)</span>
+                        <span className="text-cyan-700 font-bold">{carteraInicialPrestPct}%</span>
+                      </label>
+                      <input type="range" min="0" max="100" step="5" value={carteraInicialPrestPct} onChange={e => setCarteraInicialPrestPct(+e.target.value)} className="w-full mt-1 accent-cyan-600" />
+                      <p className="text-[10px] text-slate-500 mt-1 leading-tight">% de la cuota. La cartera madura tiene un costo prestacional distinto (y mayor) que la cartera nueva.</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 bg-fuchsia-500 rounded-full"></span>
+                    Aguinaldo (Ene/Jul)
+                  </span>
+                  <span className="text-fuchsia-700 font-bold">{aguinaldoPct}%</span>
+                </label>
+                <input type="range" min="0" max="100" step="5" value={aguinaldoPct} onChange={e => setAguinaldoPct(+e.target.value)} className="w-full mt-2 accent-fuchsia-600" />
+                <p className="text-[10px] text-slate-500 mt-1 leading-tight">Porción del aguinaldo destinada al proyecto. 100% = 50% × cuota × meses activos/6, cada 6 meses.</p>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span className="flex items-center gap-1">
+                    <span className="w-2 h-2 bg-orange-500 rounded-full"></span>
+                    IVA pago al broker
+                  </span>
+                  <span className="text-orange-700 font-bold">{ivaPct}%</span>
+                </label>
+                <input type="range" min="0" max="21" step="1" value={ivaPct} onChange={e => setIvaPct(+e.target.value)} className="w-full mt-2 accent-orange-600" />
+                <p className="text-[10px] text-slate-500 mt-1 leading-tight">% de IVA que queda como costo a financiar (no recuperable). 21% = IVA pleno; 0% = totalmente recuperable.</p>
+              </div>
+
+              {(ventasBrokerEn(1) + ventasOS) > 0 && (
+                <div className="mt-3 pt-3 border-t border-slate-200 text-xs text-slate-600">
+                  <div className="flex justify-between">
+                    <span>Ventas Año 2+ /mes</span>
+                    <span className="font-bold text-slate-900">{(ventasY2plus + ventasOS).toLocaleString("es-AR")}</span>
+                  </div>
+                  {ventasOS > 0 && (
+                    <div className="flex justify-between text-[11px] mt-1">
+                      <span>% canal OS (Año 2+)</span>
+                      <span className="font-semibold text-indigo-700">{((ventasOS / (ventasY2plus + ventasOS)) * 100).toFixed(0)}%</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-3">Pago al Broker — Mix A/C</h3>
+              <label className="text-xs font-medium text-slate-600 flex justify-between">
+                <span style={{ color: colorMode.A }}>● {pctModoA}% Modo A</span>
+                <span style={{ color: colorMode.C }}>{100 - pctModoA}% Modo C ●</span>
+              </label>
+              <input type="range" min="0" max="100" step="5" value={100 - pctModoA} onChange={e => setPctModoA(100 - (+e.target.value))} className="w-full mt-2 accent-slate-700" />
+              <div className="flex justify-between text-[9px] text-slate-400 mt-1">
+                <span>todo A</span><span>50/50</span><span>todo C</span>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-3 leading-relaxed">{mixDescripcion}. Modo A: pago one-shot al facturar (M+1). Modo C: 3 cheques a 60/90/120 días.</p>
+
+              <div className="mt-4 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-700 flex justify-between">
+                  <span>Cupo máx. en valores propios a descontar</span>
+                  <span className="font-bold text-indigo-700">${cupoChequesPropios.toLocaleString("es-AR")}M</span>
+                </label>
+                <input type="range" min="0" max="5000" step="100" value={cupoChequesPropios} onChange={e => setCupoChequesPropios(+e.target.value)} className="w-full mt-2 accent-indigo-600" />
+                <div className="flex justify-between text-[9px] text-slate-400 mt-1">
+                  <span>$0M</span><span>$2.500M</span><span>$5.000M</span>
+                </div>
+                <p className="text-[10px] text-slate-500 mt-2 leading-tight">Difiere el tramo de <span className="font-semibold">Modo A</span> a cheques propios (60/90/120 días, mismo CAC) hasta este tope revolvente de cheques abiertos. Lo que excede se paga one-shot en M+1.{cupoChequesPropios > 0 ? ` Cheques propios en circulación (pico): $${simulacion.chequesPropiosMax.toLocaleString("es-AR")}M.` : ""}</p>
+              </div>
+
+              <div className="mt-4 pt-3 border-t border-slate-200 space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span style={{ color: colorMode.A }}>● CAC Modo A</span>
+                    <span className="text-teal-700 font-bold">{cacA.toFixed(2)}</span>
+                  </label>
+                  <input type="range" min="3" max="6" step="0.25" value={cacA} onChange={e => setCacA(+e.target.value)} className="w-full mt-1 accent-teal-600" />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span style={{ color: colorMode.C }}>● CAC Modo C</span>
+                    <span className="text-amber-700 font-bold">{cacC.toFixed(2)}</span>
+                  </label>
+                  <input type="range" min="3" max="7" step="0.25" value={cacC} onChange={e => setCacC(+e.target.value)} className="w-full mt-1 accent-amber-600" />
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <p className="text-xs font-semibold text-slate-700 mb-3 flex items-center gap-1">
+                <span className="w-2 h-2 bg-violet-500 rounded-full"></span>
+                INVERSIÓN EN MARKETING (mensual)
+              </p>
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span>Año 1 (meses 1–12)</span>
+                    <span className="text-violet-700 font-bold">${mktY1}M</span>
+                  </label>
+                  <input type="range" min="0" max="100" step="1" value={mktY1} onChange={e => setMktY1(+e.target.value)} className="w-full mt-1 accent-violet-600" />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span>Año 2 (meses 13–24)</span>
+                    <span className="text-violet-700 font-bold">${mktY2}M</span>
+                  </label>
+                  <input type="range" min="0" max="100" step="1" value={mktY2} onChange={e => setMktY2(+e.target.value)} className="w-full mt-1 accent-violet-600" />
+                </div>
+                <div>
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span>Año 3+ (mes 25+)</span>
+                    <span className="text-violet-700 font-bold">${mktY3}M</span>
+                  </label>
+                  <input type="range" min="0" max="100" step="1" value={mktY3} onChange={e => setMktY3(+e.target.value)} className="w-full mt-1 accent-violet-600" />
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-3 leading-tight">Costo operativo mensual constante dentro de cada tramo. Impacta el flujo de caja y, por lo tanto, la necesidad de financiamiento.</p>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div className="flex-1">
+                  <p className="text-xs font-medium text-slate-700 flex items-center gap-1">
+                    <span className="w-2 h-2 bg-rose-500 rounded-full"></span>
+                    Retiro de socios
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-0.5 leading-tight">Retiro mensual desde el mes siguiente al pico de deuda. Sale de caja, no genera deuda.</p>
+                </div>
+                <button
+                  onClick={() => setRetiroEnabled(!retiroEnabled)}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition flex-shrink-0 ${retiroEnabled ? "bg-rose-600" : "bg-slate-300"}`}
+                >
+                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition ${retiroEnabled ? "translate-x-6" : "translate-x-1"}`} />
+                </button>
+              </label>
+              {retiroEnabled && (
+                <div className="mt-3">
+                  <label className="text-xs font-medium text-slate-600 flex justify-between">
+                    <span>Retiro mensual</span>
+                    <span className="text-rose-700 font-bold">${retiroMensual}M</span>
+                  </label>
+                  <input type="range" min="0" max="3000" step="50" value={retiroMensual} onChange={e => setRetiroMensual(+e.target.value)} className="w-full mt-1 accent-rose-600" />
+                  {simulacion.mesPicoDeuda && (
+                    <p className="text-[10px] text-slate-500 mt-2">Pico de deuda en mes {simulacion.mesPicoDeuda}. Retiro arranca en mes {simulacion.mesPicoDeuda + 1}. Total retirado: <span className="font-bold text-rose-700">{fmtM(simulacion.totalRetirado)}</span></p>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <h3 className="text-sm font-semibold text-slate-700 uppercase tracking-wide mb-4">Prestacional por edad</h3>
+              <div className="mb-3">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Mes 1-6</span>
+                  <span className="text-emerald-700 font-bold">{cmY1H1}%</span>
+                </label>
+                <input type="range" min="20" max="90" step="5" value={cmY1H1} onChange={e => setCmY1H1(+e.target.value)} className="w-full mt-2 accent-emerald-600" />
+              </div>
+              <div className="mb-3">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Mes 7-12</span>
+                  <span className="text-teal-700 font-bold">{cmY1H2}%</span>
+                </label>
+                <input type="range" min="20" max="90" step="5" value={cmY1H2} onChange={e => setCmY1H2(+e.target.value)} className="w-full mt-2 accent-teal-600" />
+              </div>
+              <div className="mb-3">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Año 2</span>
+                  <span className="text-amber-700 font-bold">{cmY2}%</span>
+                </label>
+                <input type="range" min="20" max="90" step="5" value={cmY2} onChange={e => setCmY2(+e.target.value)} className="w-full mt-2 accent-amber-600" />
+              </div>
+              <div className="mb-3">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Año 3+</span>
+                  <span className="text-rose-700 font-bold">{cmY3}%</span>
+                </label>
+                <input type="range" min="20" max="90" step="5" value={cmY3} onChange={e => setCmY3(+e.target.value)} className="w-full mt-2 accent-rose-600" />
+              </div>
+              <div className="mt-3 pt-3 border-t border-slate-200">
+                <label className="text-xs font-medium text-slate-600 flex justify-between">
+                  <span>Churn mensual</span>
+                  <span className="text-slate-700 font-bold">{churnMensual}%</span>
+                </label>
+                <input type="range" min="0" max="5" step="0.5" value={churnMensual} onChange={e => setChurnMensual(+e.target.value)} className="w-full mt-2 accent-slate-600" />
+              </div>
+            </div>
+
+            <div className="bg-slate-900 rounded-xl shadow-sm p-5 text-white">
+              <h3 className="text-sm font-semibold uppercase tracking-wide mb-3 text-slate-300">Financiamiento</h3>
+              <div className="mb-3">
+                <label className="text-xs font-medium text-slate-300 flex justify-between">
+                  <span>TNA</span>
+                  <span className="text-amber-300 font-bold">{tnaPct}%</span>
+                </label>
+                <input type="range" min="20" max="80" step="1" value={tnaPct} onChange={e => setTnaPct(+e.target.value)} className="w-full mt-2 accent-amber-500" />
+              </div>
+              <div className="space-y-1 text-xs text-slate-300 mt-3 pt-3 border-t border-slate-700">
+                <div className="flex justify-between"><span>Tasa mensual</span><span className="font-bold">{tasaMensual.toFixed(2)}%</span></div>
+                <div className="flex justify-between"><span>Plazo</span><span className="font-bold">12 meses</span></div>
+                <div className="flex justify-between"><span>Sistema</span><span className="font-bold">Francés</span></div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200">
+              <label className="text-xs font-medium text-slate-600 flex justify-between">
+                <span>Horizonte (meses)</span>
+                <span className="text-teal-700 font-bold">{meses}</span>
+              </label>
+              <input type="range" min="12" max="60" step="6" value={meses} onChange={e => setMeses(+e.target.value)} className="w-full mt-2 accent-teal-600" />
+            </div>
+          </div>
+
+          <div className="lg:col-span-3 space-y-6">
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200 relative">
+                <button onClick={() => setInfoMetrica("Payback")} className="absolute top-3 right-3 w-5 h-5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs font-bold flex items-center justify-center transition" title="¿Qué es?">i</button>
+                <div className="flex items-center gap-2 mb-1">
+                  <div className={`w-2 h-2 rounded-full ${colorSemaforo[semaforoPayback]}`}></div>
+                  <p className="text-xs text-slate-500 uppercase tracking-wide">Payback</p>
+                </div>
+                <p className="text-3xl font-bold text-slate-900">{simulacion.mesPaybackFin || "N/A"}</p>
+                <p className="text-xs text-slate-500 mt-1">meses al breakeven operativo</p>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200 relative">
+                <button onClick={() => setInfoMetrica("Autosuficiencia")} className="absolute top-3 right-3 w-5 h-5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs font-bold flex items-center justify-center transition" title="¿Qué es?">i</button>
+                <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">Autosuficiencia</p>
+                <p className="text-3xl font-bold text-slate-900">{simulacion.mesAutosuficiencia || "N/A"}</p>
+                <p className="text-xs text-slate-500 mt-1">mes sin nuevos préstamos</p>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200 relative">
+                <button onClick={() => setInfoMetrica("Deuda máxima")} className="absolute top-3 right-3 w-5 h-5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs font-bold flex items-center justify-center transition" title="¿Qué es?">i</button>
+                <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">Deuda máxima</p>
+                <p className="text-3xl font-bold text-rose-600">{formatMoney(Math.round(simulacion.deudaMaxima / 1_000_000))}</p>
+                <p className="text-xs text-slate-500 mt-1">stock máximo de deuda</p>
+              </div>
+              <div className="bg-white rounded-xl shadow-sm p-5 border border-slate-200 relative">
+                <button onClick={() => setInfoMetrica("LTV / CAC")} className="absolute top-3 right-3 w-5 h-5 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-500 text-xs font-bold flex items-center justify-center transition" title="¿Qué es?">i</button>
+                <div className="flex items-center gap-2 mb-1">
+                  <div className={`w-2 h-2 rounded-full ${colorSemaforo[semaforoLtvCac]}`}></div>
+                  <p className="text-xs text-slate-500 uppercase tracking-wide">LTV / CAC</p>
+                </div>
+                <p className="text-3xl font-bold text-slate-900">{simulacion.ratioLtvCac.toFixed(1)}x</p>
+                <p className="text-xs text-slate-500 mt-1">canal broker {aguinaldoEnabled ? "+ aguinaldo" : ""}{ivaBrokerEnabled ? " · CAC c/IVA" : ""}</p>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-md p-6 border-2 border-emerald-200">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="bg-emerald-600 text-white text-xs font-bold uppercase tracking-wider px-2 py-1 rounded">Cartera</div>
+                <h3 className="text-2xl font-bold text-slate-900">Evolución de la cartera</h3>
+              </div>
+
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+                <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-100">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Stock al mes {meses}</p>
+                  <p className="text-2xl font-bold text-emerald-700">{simulacion.stockFinal.toLocaleString("es-AR")}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">cápitas activas</p>
+                </div>
+                <div className="bg-slate-50 rounded-lg p-3 border border-slate-200">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Altas acumuladas</p>
+                  <p className="text-2xl font-bold text-slate-800">{simulacion.data.reduce((acc, d) => acc + d.altasMes, 0).toLocaleString("es-AR")}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">cápitas vendidas (horizonte)</p>
+                </div>
+                <div className="bg-rose-50 rounded-lg p-3 border border-rose-100">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Bajas acumuladas</p>
+                  <p className="text-2xl font-bold text-rose-700">{Math.round(simulacion.data.reduce((acc, d) => acc + d.bajasMes, 0)).toLocaleString("es-AR")}</p>
+                  <p className="text-[10px] text-slate-500 mt-1">churn acumulado</p>
+                </div>
+                <div className="bg-blue-50 rounded-lg p-3 border border-blue-100 relative">
+                  <button onClick={() => setInfoMetrica("Valorización de cartera")} className="absolute top-2 right-2 w-4 h-4 rounded-full bg-blue-100 hover:bg-blue-200 text-blue-600 text-[10px] font-bold flex items-center justify-center transition" title="¿Qué es?">i</button>
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Valorización de cartera</p>
+                  {carteraInicialEnabled ? (
+                    <>
+                      <p className="text-2xl font-bold text-blue-700">
+                        ${Math.round((valorizConCartera ? simulacion.valorizacionCartera : simulacion.valorizacionNueva) / 1_000_000).toLocaleString("es-AR")}M
+                      </p>
+                      <div className="flex gap-1 mt-1.5">
+                        <button
+                          onClick={() => setValorizConCartera(true)}
+                          className={`text-[9px] px-2 py-0.5 rounded font-semibold transition ${valorizConCartera ? "bg-blue-600 text-white" : "bg-blue-100 text-blue-600 hover:bg-blue-200"}`}
+                        >Total</button>
+                        <button
+                          onClick={() => setValorizConCartera(false)}
+                          className={`text-[9px] px-2 py-0.5 rounded font-semibold transition ${!valorizConCartera ? "bg-blue-600 text-white" : "bg-blue-100 text-blue-600 hover:bg-blue-200"}`}
+                        >Solo nueva</button>
+                      </div>
+                      <div className="mt-1.5 pt-1.5 border-t border-blue-100 space-y-0.5">
+                        <div className="flex justify-between text-[10px] text-slate-500">
+                          <span>Nueva</span>
+                          <span className="font-semibold text-slate-700">${Math.round(simulacion.valorizacionNueva / 1_000_000).toLocaleString("es-AR")}M</span>
+                        </div>
+                        <div className="flex justify-between text-[10px] text-slate-500">
+                          <span>Preexistente</span>
+                          <span className="font-semibold text-cyan-700">${Math.round(simulacion.valorizacionInicial / 1_000_000).toLocaleString("es-AR")}M</span>
+                        </div>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-2xl font-bold text-blue-700">${Math.round(simulacion.valorizacionCartera / 1_000_000).toLocaleString("es-AR")}M</p>
+                      <p className="text-[10px] text-slate-500 mt-1">facturación mes {meses} × {valorizMultiplicador}</p>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="mb-6">
+                <h4 className="text-base font-bold text-slate-900 mb-1">Stock de cápitas activas<InfoBtn k="Stock de cápitas activas" /></h4>
+                <p className="text-xs text-slate-500 mb-3">Crecimiento de la cartera mes a mes (broker + OS, neto de churn)</p>
+                <ResponsiveContainer width="100%" height={240}>
+                  <LineChart data={simulacion.data}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                    <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => v.toLocaleString("es-AR")} />
+                    <Tooltip formatter={v => v.toLocaleString("es-AR") + " cápitas"} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                    <Line type="monotone" dataKey="stockCapitas" stroke="#059669" strokeWidth={3} dot={false} name="Cápitas activas" />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div className="mb-6">
+                <h4 className="text-base font-bold text-slate-900 mb-1">Altas y bajas mensuales<InfoBtn k="Altas y bajas mensuales" /></h4>
+                <p className="text-xs text-slate-500 mb-3">Incorporaciones del mes (verde) vs cápitas perdidas por churn (rojo)</p>
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={simulacion.data}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                    <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => v.toLocaleString("es-AR")} />
+                    <Tooltip formatter={v => v.toLocaleString("es-AR") + " cápitas"} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="altasMes" fill="#10b981" name="Altas" />
+                    <Bar dataKey="bajasMes" fill="#ef4444" name="Bajas (churn)" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div>
+                <h4 className="text-base font-bold text-slate-900 mb-1">Ingresos mensuales por cartera<InfoBtn k="Ingresos mensuales por cartera" /></h4>
+                <p className="text-xs text-slate-500 mb-3">Lo que entra a ROISA: broker (100%) + OS recaudación (95% desde mes 6) + aguinaldo. Excluye financiación OS.</p>
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={simulacion.data}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                    <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                    <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => `$${v}M`} />
+                    <Tooltip formatter={v => formatMoney(v)} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="ingresosBroker" fill="#3b82f6" name="Ingresos broker" stackId="ingresos" />
+                    <Bar dataKey="ingresosOSRecaudacion" fill="#6366f1" name="Ingresos OS (95%)" stackId="ingresos" />
+                    <Bar dataKey="aguinaldo" fill="#d946ef" name="Aguinaldo" stackId="ingresos" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <button
+              onClick={() => setShowDetailTable(!showDetailTable)}
+              className="w-full bg-gradient-to-r from-slate-900 to-slate-700 text-white rounded-xl p-4 font-semibold hover:from-slate-800 hover:to-slate-600 transition flex items-center justify-between shadow-md"
+            >
+              <span className="flex items-center gap-2">
+                <span className="text-lg">📊</span>
+                {showDetailTable ? "Ocultar detalle del cashflow mensual" : "Ver detalle del cashflow mensual"}
+              </span>
+              <span className="text-xs bg-white/20 px-2 py-1 rounded">{showDetailTable ? "▲" : "▼"}</span>
+            </button>
+
+            {showDetailTable && (
+              <div className="bg-white rounded-xl shadow-md p-6 border-2 border-slate-300">
+                <div className="flex items-center justify-between mb-3">
+                  <div>
+                    <h3 className="text-lg font-bold text-slate-900">Detalle del cashflow — Mix {pctModoA}% A / {100 - pctModoA}% C</h3>
+                    <p className="text-xs text-slate-500">Valores en millones de ARS. Aguinaldo se cobra en meses {Array.from({length: Math.ceil(meses/6)}, (_, i) => i*6+1).filter(m => m <= meses).join(", ")}.{ivaBrokerEnabled ? ` Pago broker incluye IVA ${ivaPct}%.` : ""}</p>
+                  </div>
+                  <div className="text-xs text-slate-500 italic">scroll horizontal →</div>
+                </div>
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="text-xs min-w-full">
+                    <thead className="bg-slate-100 border-b-2 border-slate-300">
+                      <tr>
+                        <th className="text-left px-3 py-2 font-semibold text-slate-700 sticky left-0 bg-slate-100 z-10">Mes</th>
+                        <th className="text-right px-3 py-2 font-semibold text-emerald-700 bg-emerald-50/60">Altas</th>
+                        <th className="text-right px-3 py-2 font-semibold text-rose-700 bg-rose-50/60">Bajas</th>
+                        <th className="text-right px-3 py-2 font-semibold text-slate-900 bg-slate-50">Cartera</th>
+                        <th className="text-right px-3 py-2 font-semibold text-emerald-700">Ing. Broker</th>
+                        <th className="text-right px-3 py-2 font-semibold text-indigo-700">Ing. OS (95%)</th>
+                        <th className="text-right px-3 py-2 font-semibold text-fuchsia-700">Aguinaldo</th>
+                        <th className="text-right px-3 py-2 font-semibold text-indigo-700">Financ. OS</th>
+                        <th className="text-right px-3 py-2 font-semibold text-emerald-900 bg-emerald-50">Total Ing.</th>
+                        <th className="text-right px-3 py-2 font-semibold text-amber-700">Prestacional</th>
+                        <th className="text-right px-3 py-2 font-semibold text-rose-700">Pago Broker</th>
+                        {ivaBrokerEnabled && <th className="text-right px-3 py-2 font-semibold text-orange-700">└ IVA</th>}
+                        <th className="text-right px-3 py-2 font-semibold text-violet-700">Marketing</th>
+                        <th className="text-right px-3 py-2 font-semibold text-violet-700">Cuotas Préstamos</th>
+                        <th className="text-right px-3 py-2 font-semibold text-rose-900 bg-rose-50">Total Egr.</th>
+                        <th className="text-right px-3 py-2 font-semibold text-slate-900 bg-slate-100">Flujo Op.</th>
+                        <th className="text-right px-3 py-2 font-semibold text-violet-700">Nvo. Préstamo</th>
+                        <th className="text-right px-3 py-2 font-semibold text-emerald-700">Precancel.</th>
+                        <th className="text-right px-3 py-2 font-semibold text-rose-700">Retiro</th>
+                        <th className="text-right px-3 py-2 font-semibold text-cyan-700">Caja</th>
+                        <th className="text-right px-3 py-2 font-semibold text-slate-900">Flujo Neto</th>
+                        <th className="text-right px-3 py-2 font-semibold text-slate-900 bg-indigo-50">Acum. Op.</th>
+                        <th className="text-right px-3 py-2 font-semibold text-rose-700">Deuda Vig.</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {simulacion.data.map((row, idx) => {
+                        const totalEgresos = row.costoPrestacional + row.pagoBroker + row.cuotasPrestamos + row.marketing;
+                        const isAguinaldo = row.mes % 6 === 1;
+                        return (
+                          <tr key={row.mes} className={`border-b border-slate-100 ${idx % 2 === 0 ? "bg-white" : "bg-slate-50/50"} ${isAguinaldo && aguinaldoEnabled ? "ring-1 ring-fuchsia-100" : ""} hover:bg-amber-50`}>
+                            <td className={`px-3 py-2 font-bold sticky left-0 bg-inherit z-10 ${isAguinaldo && aguinaldoEnabled ? "text-fuchsia-700" : "text-slate-900"}`}>{row.mes}{isAguinaldo && aguinaldoEnabled ? "★" : ""}</td>
+                            <td className="px-3 py-2 text-right font-mono text-emerald-700 bg-emerald-50/40">{row.altasMes > 0 ? `+${row.altasMes.toLocaleString("es-AR")}` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-rose-700 bg-rose-50/40">{row.bajasMes > 0 ? `-${row.bajasMes.toLocaleString("es-AR")}` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono font-bold text-slate-900 bg-slate-50">{row.stockCapitas.toLocaleString("es-AR")}</td>
+                            <td className="px-3 py-2 text-right font-mono">{row.ingresosBroker > 0 ? `$${row.ingresosBroker.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono">{row.ingresosOSRecaudacion > 0 ? `$${row.ingresosOSRecaudacion.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-fuchsia-700">{row.aguinaldo > 0 ? `$${row.aguinaldo.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono">{row.financiacionOS > 0 ? `$${row.financiacionOS.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono font-bold text-emerald-900 bg-emerald-50">${row.ingresos.toLocaleString("es-AR")}M</td>
+                            <td className="px-3 py-2 text-right font-mono text-amber-700">{row.costoPrestacional > 0 ? `-$${row.costoPrestacional.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-rose-700">{row.pagoBroker > 0 ? `-$${row.pagoBroker.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            {ivaBrokerEnabled && <td className="px-3 py-2 text-right font-mono text-orange-700">{row.ivaBroker > 0 ? `-$${row.ivaBroker.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>}
+                            <td className="px-3 py-2 text-right font-mono text-violet-700">{row.marketing > 0 ? `-$${row.marketing.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-violet-700">{row.cuotasPrestamos > 0 ? `-$${row.cuotasPrestamos.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono font-bold text-rose-900 bg-rose-50">-${totalEgresos.toLocaleString("es-AR")}M</td>
+                            <td className={`px-3 py-2 text-right font-mono font-bold bg-slate-100 ${row.flujoOperativo >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.flujoOperativo >= 0 ? "+" : ""}${row.flujoOperativo.toLocaleString("es-AR")}M</td>
+                            <td className="px-3 py-2 text-right font-mono text-violet-700">{row.nuevoPrestamo > 0 ? `+$${row.nuevoPrestamo.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-emerald-700">{row.precancelacion > 0 ? `-$${row.precancelacion.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-rose-700">{row.retiro > 0 ? `-$${row.retiro.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-cyan-700">{row.saldoCaja > 0 ? `$${row.saldoCaja.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className={`px-3 py-2 text-right font-mono ${row.flujoNeto >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.flujoNeto >= 0 ? "+" : ""}${row.flujoNeto.toLocaleString("es-AR")}M</td>
+                            <td className={`px-3 py-2 text-right font-mono font-bold bg-indigo-50 ${row.acumuladoOperativo >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.acumuladoOperativo >= 0 ? "+" : ""}${row.acumuladoOperativo.toLocaleString("es-AR")}M</td>
+                            <td className="px-3 py-2 text-right font-mono text-rose-700">{row.deudaVigente > 0 ? `$${row.deudaVigente.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+                <p className="text-[11px] text-slate-500 mt-3 leading-relaxed">
+                  <strong>Lectura:</strong> filas marcadas con ★ son meses de aguinaldo (cada 6 meses). El flujo operativo de esos meses incluye el ingreso extra del aguinaldo, lo que típicamente reduce el déficit o genera superávit.{ivaBrokerEnabled ? ` La columna IVA muestra el ${ivaPct}% sobre el pago al broker, ya incluido dentro de "Pago Broker".` : ""}
+                </p>
+              </div>
+            )}
+
+            <div className="bg-white rounded-xl shadow-sm p-6 border border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900 mb-1">Flujo operativo y financiamiento mensual<InfoBtn k="Flujo operativo y financiamiento mensual" /></h3>
+              <p className="text-xs text-slate-500 mb-4">Mix {pctModoA}%A/{100-pctModoA}%C — Línea: flujo operativo. Barras: préstamo nuevo del mes.</p>
+              <ResponsiveContainer width="100%" height={320}>
+                <ComposedChart data={simulacion.data}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                  <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => `$${v}M`} />
+                  <Tooltip formatter={v => formatMoney(v)} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                  {simulacion.mesAutosuficiencia && (
+                    <ReferenceLine x={simulacion.mesAutosuficiencia} stroke="#0d9488" strokeDasharray="3 3" label={{ value: `Autosuf. m${simulacion.mesAutosuficiencia}`, position: "top", fill: "#0d9488", fontSize: 11 }} />
+                  )}
+                  <Bar dataKey="nuevoPrestamo" fill="#7c3aed" name="Nuevo préstamo" />
+                  <Line type="monotone" dataKey="flujoOperativo" stroke="#0f172a" strokeWidth={3} dot={false} name="Flujo operativo" />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-6 border border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900 mb-1">Acumulado operativo (payback real)<InfoBtn k="Acumulado operativo (payback real)" /></h3>
+              <p className="text-xs text-slate-500 mb-4">Cuando cruza a positivo, recuperaste la inversión total con intereses.</p>
+              <ResponsiveContainer width="100%" height={280}>
+                <LineChart data={simulacion.data}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                  <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => `$${v}M`} />
+                  <Tooltip formatter={v => formatMoney(v)} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                  <ReferenceLine y={0} stroke="#94a3b8" strokeDasharray="3 3" />
+                  {simulacion.mesPaybackFin && (
+                    <ReferenceLine x={simulacion.mesPaybackFin} stroke="#0d9488" strokeDasharray="3 3" label={{ value: `Payback m${simulacion.mesPaybackFin}`, position: "top", fill: "#0d9488", fontSize: 11 }} />
+                  )}
+                  <Line type="monotone" dataKey="acumuladoOperativo" stroke="#0f172a" strokeWidth={3} dot={false} name="Acumulado operativo" />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-6 border border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900 mb-1">Composición mensual<InfoBtn k="Composición mensual" /></h3>
+              <p className="text-xs text-slate-500 mb-4">Ingresos por fuente vs egresos (mix {pctModoA}%A/{100-pctModoA}%C)</p>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={simulacion.data}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                  <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => `$${v}M`} />
+                  <Tooltip formatter={v => formatMoney(v)} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  <Bar dataKey="ingresosBroker" fill="#0d9488" name="Ingresos broker" stackId="ingresos" />
+                  <Bar dataKey="ingresosOSRecaudacion" fill="#6366f1" name="Ingresos OS (95%)" stackId="ingresos" />
+                  <Bar dataKey="aguinaldo" fill="#d946ef" name="Aguinaldo" stackId="ingresos" />
+                  <Bar dataKey="financiacionOS" fill="#a5b4fc" name="Financiación OS" stackId="ingresos" />
+                  <Bar dataKey="costoPrestacional" fill="#f59e0b" name="Prestacional" stackId="egresos" />
+                  <Bar dataKey="pagoBroker" fill="#ef4444" name="Pago broker" stackId="egresos" />
+                  <Bar dataKey="cuotasPrestamos" fill="#7c3aed" name="Cuotas préstamos" stackId="egresos" />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-6 border border-slate-200">
+              <h3 className="text-lg font-bold text-slate-900 mb-1">% Prestacional efectivo mensual<InfoBtn k="% Prestacional efectivo mensual" /></h3>
+              <p className="text-xs text-slate-500 mb-4">Promedio ponderado según la mezcla de cohortes activas cada mes.</p>
+              <ResponsiveContainer width="100%" height={220}>
+                <LineChart data={simulacion.data.filter(d => d.pctPrestEfectivo > 0)}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                  <XAxis dataKey="mes" stroke="#64748b" style={{ fontSize: 11 }} />
+                  <YAxis stroke="#64748b" style={{ fontSize: 11 }} tickFormatter={v => `${v}%`} domain={[0, 100]} />
+                  <Tooltip formatter={v => `${v}%`} contentStyle={{ borderRadius: 8, border: "1px solid #e2e8f0" }} />
+                  <ReferenceLine y={cmY1H1} stroke="#10b981" strokeDasharray="2 2" label={{ value: `Y1H1 ${cmY1H1}%`, position: "right", fill: "#10b981", fontSize: 10 }} />
+                  <ReferenceLine y={cmY3} stroke="#e11d48" strokeDasharray="2 2" label={{ value: `Y3+ ${cmY3}%`, position: "right", fill: "#e11d48", fontSize: 10 }} />
+                  <Line type="monotone" dataKey="pctPrestEfectivo" stroke="#0f172a" strokeWidth={3} dot={false} name="% Prestacional" />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+
+            <div className="bg-gradient-to-br from-indigo-50 to-slate-50 rounded-xl shadow-md p-6 border-2 border-indigo-200">
+              <div className="flex items-center gap-3 mb-2">
+                <div className="bg-indigo-600 text-white text-xs font-bold uppercase tracking-wider px-2 py-1 rounded">Resumen</div>
+                <h3 className="text-2xl font-bold text-slate-900">Escenario actual</h3>
+              </div>
+              <p className="text-sm text-slate-600 mb-6">
+                {mixDescripcion}{ventasOS > 0 ? `, ${ventasOS} cápitas/mes vía OS` : ""}{aguinaldoEnabled ? ", aguinaldo activo" : ""}{ivaBrokerEnabled ? `, IVA broker +${ivaPct}%` : ""}{carteraInicialEnabled ? `, cartera base ${carteraInicialCant.toLocaleString("es-AR")}` : ""}{retiroEnabled ? `, retiro $${retiroMensual}M/mes` : ""}.
+              </p>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="bg-white rounded-lg p-4 border border-slate-200">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Payback</p>
+                  <p className="text-2xl font-bold text-slate-900">{simulacion.mesPaybackFin ? `m${simulacion.mesPaybackFin}` : "N/A"}</p>
+                </div>
+                <div className="bg-white rounded-lg p-4 border border-slate-200">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Deuda máxima</p>
+                  <p className="text-2xl font-bold text-rose-700">${Math.round(simulacion.deudaMaxima / 1_000_000).toLocaleString("es-AR")}M</p>
+                </div>
+                <div className="bg-white rounded-lg p-4 border border-slate-200">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">Intereses totales</p>
+                  <p className="text-2xl font-bold text-violet-700">${Math.round(simulacion.totalInteresesPagados / 1_000_000).toLocaleString("es-AR")}M</p>
+                </div>
+                <div className="bg-white rounded-lg p-4 border border-slate-200">
+                  <p className="text-[10px] text-slate-500 uppercase tracking-wide">{retiroEnabled ? "Total retirado" : "LTV / CAC"}</p>
+                  <p className="text-2xl font-bold text-emerald-700">{retiroEnabled ? `$${Math.round(simulacion.totalRetirado / 1_000_000).toLocaleString("es-AR")}M` : `${simulacion.ratioLtvCac.toFixed(1)}x`}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl shadow-md p-6 border-2 border-slate-300">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="bg-slate-900 text-white text-xs font-bold uppercase tracking-wider px-2 py-1 rounded">Supuestos</div>
+                <h3 className="text-2xl font-bold text-slate-900">Cómo funciona el modelo</h3>
+              </div>
+              <p className="text-sm text-slate-600 mb-6">
+                Descripción textual de todos los supuestos y la mecánica de cohortes. Los valores del ejemplo se actualizan según los parámetros que tengas seleccionados (mix {pctModoA}% A / {100-pctModoA}% C, cuota {fmtPesos(cuotaPromedio)}, CAC efectivo {ejemplo.cac.toFixed(2)}).
+              </p>
+
+              <div className="space-y-5 text-sm text-slate-700 leading-relaxed">
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">1. Adquisición de la cápita (mes M)</h4>
+                  <p>La venta se produce en el mes M. Cada cápita vendida representa un afiliado que se incorpora a la cartera. El modelo incluye un "Mes 0" de ventas previas al inicio del análisis: como ya estamos vendiendo, esas cápitas tienen compromisos de pago al broker que caen dentro del horizonte (factura en M+1) y recaudan/generan prestacional desde el mes 1. La curva de ventas del primer año se define mes a mes (sliders Mes 1 a Mes 12) para modelar el crecimiento; del mes 13 en adelante se usa el valor fijo "Año 2+". El canal OS, si está activo, aporta cápitas adicionales constantes todos los meses.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">2. Facturación del broker (mes M+1)</h4>
+                  <p>El broker factura su comisión el mes siguiente a la venta (M+1). A partir de esa factura se cuentan los plazos de pago. Por eso todos los pagos al broker están corridos un mes respecto a la venta.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">3. Pago al broker — Mix {pctModoA}% A / {100-pctModoA}% C</h4>
+                  <p className="mb-2">{mixDescripcion}. El pago total por cápita (CAC efectivo {ejemplo.cac.toFixed(2)} × cuota) es <strong>{fmtPesos(ejemplo.pagoNeto)}</strong> {ivaBrokerEnabled ? `(neto, sin IVA)` : ""}.</p>
+                  {ivaBrokerEnabled && (
+                    <p className="mb-2">Sobre ese pago se suma IVA {ivaPct}% = {fmtPesos(ejemplo.iva)}, llevando el costo de adquisición total a <strong>{fmtPesos(ejemplo.pagoConIva)}</strong>. Este IVA se trata como costo pleno a financiar.</p>
+                  )}
+                  <div className="bg-slate-50 rounded-lg p-3 mt-2 border border-slate-200">
+                    <p className="text-xs font-semibold text-slate-600 mb-2">Cronograma de pago de esta cápita:</p>
+                    <div className="space-y-1">
+                      {ejemplo.cheques.map((ch, i) => (
+                        <div key={i} className="flex justify-between text-xs font-mono">
+                          <span className="text-slate-600">{ch.mes} ({ch.desc})</span>
+                          <span className="font-semibold text-rose-700">{fmtPesos(ch.monto)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">4. Inicio del gasto prestacional (mes M+1)</h4>
+                  <p>La cobertura médica se activa en M+1 (el mes siguiente a la venta), aunque todavía no se haya cobrado ninguna cuota. Desde ese mes corre el costo prestacional, calculado sobre la cuota teórica de las cápitas con cobertura activa. En el primer tramo de vida (meses 1-6) el prestacional es {cmY1H1}% de la cuota = {fmtPesos(ejemplo.prestacionalMes1)} por cápita por mes. Este porcentaje sube según la edad de la cápita ({cmY1H1}% → {cmY1H2}% → {cmY2}% → {cmY3}%).</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">5. Primer ingreso por recaudación (mes M+2)</h4>
+                  <p>La primera cuota se recauda en M+2. A partir de ahí la cápita aporta su cuota mensual ({fmtPesos(ejemplo.cuota)}) mientras siga activa. Hay entonces una ventana de dos meses (M+1 y parte de M+2) donde ya hay costo prestacional pero todavía no entró recaudación de esa cápita.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">6. Churn (bajas)</h4>
+                  <p>Cada mes, un {churnMensual}% de las cápitas activas se da de baja. La cartera neta crece cuando las altas superan a las bajas. El churn se aplica de forma compuesta sobre el stock de cada cohorte.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">7. Cuándo y cuánta deuda se toma</h4>
+                  <p>El modelo calcula el flujo operativo de cada mes (ingresos − prestacional − pago broker − cuotas de préstamos). El negocio lleva un saldo de caja acumulada. Cuando un mes da déficit, primero se cubre con la caja disponible y solo el faltante se financia con deuda nueva. Cuando un mes da excedente, esa caja se usa primero para precancelar capital de los préstamos vivos (priorizando los más antiguos), lo que ahorra intereses futuros y recalcula la cuota sobre el saldo remanente; lo que sobre queda en caja para los meses siguientes.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">8. Costo financiero de cada adquisición</h4>
+                  <p>Cada préstamo se toma a {tnaPct}% TNA ({tasaMensual.toFixed(2)}% mensual), a 12 meses, con sistema francés (cuota constante). Los intereses totales pagados se reparten entre todas las cápitas adquiridas para calcular el costo financiero por cápita, que se suma al CAC para obtener el "CAC efectivo" usado en la relación LTV/CAC.</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">9. Aguinaldo {aguinaldoEnabled ? "(activo)" : "(desactivado)"}</h4>
+                  <p>{aguinaldoEnabled ? `Cada 6 meses se cobra un aguinaldo equivalente a 50% de la cuota, ponderado por los meses activos de la cápita en el semestre (50% × cuota × meses_activos/6). No genera costo prestacional adicional.` : "El aguinaldo está desactivado en esta configuración."}</p>
+                </div>
+
+                <div>
+                  <h4 className="font-bold text-slate-900 mb-1">10. Valorización de cartera</h4>
+                  <p>Es una estimación del valor de la cartera: la facturación de broker del último mes del horizonte (sin aguinaldo) multiplicada por el factor configurable (×{valorizMultiplicador}). Representa una aproximación al valor de venta o transferencia de la cartera madura.</p>
+                </div>
+
+                {carteraInicialEnabled && (
+                  <div>
+                    <h4 className="font-bold text-slate-900 mb-1">11. Cartera preexistente</h4>
+                    <p>El modelo arranca con una cartera ya existente de {carteraInicialCant.toLocaleString("es-AR")} cápitas maduras (más de 2 años de antigüedad), activas desde el mes 1. Esta cartera no paga CAC ni comisión al broker (ya fue adquirida en el pasado). Recauda su cuota completa desde el primer mes y cobra aguinaldo como el resto. Su costo prestacional es propio y configurable ({carteraInicialPrestPct}% de la cuota), distinto del de la cartera nueva por tratarse de cápitas maduras, y tiene un churn propio del {carteraInicialChurn}% mensual, independiente del churn de las cohortes nuevas. En la valorización de cartera se muestra desglosada respecto de la cartera nueva generada en el horizonte.</p>
+                  </div>
+                )}
+
+                {retiroEnabled && (
+                  <div>
+                    <h4 className="font-bold text-slate-900 mb-1">12. Retiro de socios</h4>
+                    <p>A partir del mes siguiente al pico de deuda (cuando la deuda ya empieza a descender), los socios retiran ${retiroMensual}M por mes. El retiro sale de la caja disponible (excedente del mes más caja acumulada) y tiene prioridad sobre la precancelación de deuda. Nunca genera deuda nueva: si en un mes no hay caja suficiente, se retira solo lo disponible. Esto puede frenar la baja de la deuda, ya que compite con la precancelación.</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-6 bg-gradient-to-br from-emerald-50 to-teal-50 rounded-xl p-5 border-2 border-emerald-200">
+                <h4 className="font-bold text-slate-900 mb-3 flex items-center gap-2">
+                  <span className="bg-emerald-600 text-white text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded">Ejemplo</span>
+                  Ciclo de vida de una cápita (mix {pctModoA}%A/{100-pctModoA}%C)
+                </h4>
+                <p className="text-xs text-slate-600 mb-4">Seguimiento de una sola cápita vendida en el mes M, con los parámetros actuales: cuota {fmtPesos(ejemplo.cuota)}, CAC efectivo {ejemplo.cac.toFixed(2)}{ivaBrokerEnabled ? `, IVA ${ivaPct}%` : ""}.</p>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="border-b-2 border-emerald-200 text-left">
+                        <th className="py-2 px-2 font-semibold text-slate-700">Mes</th>
+                        <th className="py-2 px-2 font-semibold text-slate-700">Qué pasa</th>
+                        <th className="py-2 px-2 font-semibold text-emerald-700 text-right">Ingreso</th>
+                        <th className="py-2 px-2 font-semibold text-rose-700 text-right">Egreso</th>
+                      </tr>
+                    </thead>
+                    <tbody className="font-mono">
+                      <tr className="border-b border-emerald-100">
+                        <td className="py-2 px-2 font-bold">M</td>
+                        <td className="py-2 px-2 font-sans">Venta de la cápita</td>
+                        <td className="py-2 px-2 text-right text-slate-400">—</td>
+                        <td className="py-2 px-2 text-right text-slate-400">—</td>
+                      </tr>
+                      <tr className="border-b border-emerald-100">
+                        <td className="py-2 px-2 font-bold">M+1</td>
+                        <td className="py-2 px-2 font-sans">Broker factura · inicia cobertura · arranca prestacional ({cmY1H1}%){ejemplo.fracA > 0 ? " · pago parte A" : ""}</td>
+                        <td className="py-2 px-2 text-right text-slate-400">—</td>
+                        <td className="py-2 px-2 text-right text-rose-700">{fmtPesos(ejemplo.prestacionalMes1 + (ejemplo.fracA > 0 ? ejemplo.pagoNetoA * (1 + ivaPct/100) : 0))}</td>
+                      </tr>
+                      <tr className="border-b border-emerald-100">
+                        <td className="py-2 px-2 font-bold">M+2</td>
+                        <td className="py-2 px-2 font-sans">Primer cobro de cuota · prestacional</td>
+                        <td className="py-2 px-2 text-right text-emerald-700">{fmtPesos(ejemplo.cuota)}</td>
+                        <td className="py-2 px-2 text-right text-rose-700">{fmtPesos(ejemplo.prestacionalMes1)}</td>
+                      </tr>
+                      <tr className="border-b border-emerald-100">
+                        <td className="py-2 px-2 font-bold">M+3</td>
+                        <td className="py-2 px-2 font-sans">Cuota · prestacional{ejemplo.fracC > 0 ? " · 1er cheque parte C" : ""}</td>
+                        <td className="py-2 px-2 text-right text-emerald-700">{fmtPesos(ejemplo.cuota)}</td>
+                        <td className="py-2 px-2 text-right text-rose-700">{fmtPesos(ejemplo.prestacionalMes1 + (ejemplo.fracC > 0 ? ejemplo.pagoNetoC * (1 + ivaPct/100) / 3 : 0))}</td>
+                      </tr>
+                      <tr>
+                        <td className="py-2 px-2 font-bold">M+4 …</td>
+                        <td className="py-2 px-2 font-sans">Continúan cuotas, prestacional y los cheques C pendientes (M+4, M+5)</td>
+                        <td className="py-2 px-2 text-right text-emerald-700">{fmtPesos(ejemplo.cuota)}/mes</td>
+                        <td className="py-2 px-2 text-right text-slate-500">según mix</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+                <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide">Costo adquisición total</p>
+                    <p className="text-lg font-bold text-rose-700">{fmtPesos(ejemplo.pagoConIva)}</p>
+                    <p className="text-[10px] text-slate-500">{ivaBrokerEnabled ? `incluye IVA ${fmtPesos(ejemplo.iva)}` : "sin IVA"}</p>
+                  </div>
+                  <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide">Cuota mensual</p>
+                    <p className="text-lg font-bold text-emerald-700">{fmtPesos(ejemplo.cuota)}</p>
+                    <p className="text-[10px] text-slate-500">desde M+2, mientras siga activa</p>
+                  </div>
+                  <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide">Prestacional inicial</p>
+                    <p className="text-lg font-bold text-amber-700">{fmtPesos(ejemplo.prestacionalMes1)}</p>
+                    <p className="text-[10px] text-slate-500">{cmY1H1}% de la cuota (meses 1-6)</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-400 mt-4 leading-relaxed text-center">
+              v21 — Modelo de cohortes con maduración independiente. Cada déficit mensual financiado a {tnaPct}% TNA, 12 meses, sistema francés. {aguinaldoEnabled ? "Aguinaldo (50% × cuota × meses_activos/6) cobrado cada 6 meses. " : "Aguinaldo desactivado. "}{ivaBrokerEnabled ? `IVA ${ivaPct}% sobre pago al broker incluido en el costo de adquisición.` : "IVA broker desactivado."}
+            </p>
+          </div>
+        </div>
+        )}
+
+        {vista === "seguimiento" && (
+          <PanelSeguimiento simulacion={simulacion} params={paramsActuales} fmtM={fmtM} fmtPesos={fmtPesos} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<SimuladorCAC />);
+</script></body></html>
