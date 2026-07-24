@@ -1005,6 +1005,18 @@ function SimuladorCAC() {
 
   const paramsActuales = { ventasMes0, ventasY1, ventasY2plus, ventasOS, cuotaPromedio, cacA, cacC, mktY1, mktY2, mktY3, pctModoA, cupoChequesPropios, cmY1H1, cmY1H2, cmY2, cmY3, churnMensual, tnaPct, meses, aguinaldoPct, ivaPct, valorizMultiplicador, carteraInicialEnabled, carteraInicialCant, carteraInicialChurn, carteraInicialPrestPct, retiroEnabled, retiroMensual };
 
+  // Filas del detalle de cashflow con las cuentas reconciliadas a partir de los valores ya
+  // redondeados a millones: Total Egresos = suma de las líneas visibles (prestacional + pago broker
+  // NETO + IVA + cuotas + int. cheques + marketing); Flujo Op = Total Ing − Total Egresos; y el
+  // Acumulado Op = suma corrida del Flujo Op reconciliado. Así la tabla cierra exacto sin desfases.
+  let _acumCashflow = 0;
+  const filasCashflow = simulacion.data.map((row) => {
+    const totalEgresos = row.costoPrestacional + row.pagoBrokerNeto + row.ivaBroker + row.cuotasPrestamos + row.marketing + (row.interesCheques || 0);
+    const flujoOpRec = row.ingresos - totalEgresos;
+    _acumCashflow += flujoOpRec;
+    return { ...row, _totalEgresos: totalEgresos, _flujoOpRec: flujoOpRec, _acumOpRec: _acumCashflow };
+  });
+
   return (
     <div className="min-h-screen bg-slate-50 p-6 font-sans">
       {infoMetrica && (
@@ -1581,8 +1593,8 @@ function SimuladorCAC() {
                         <th className="text-right px-3 py-2 font-semibold text-indigo-700">Financ. OS</th>
                         <th className="text-right px-3 py-2 font-semibold text-emerald-900 bg-emerald-50">Total Ing.</th>
                         <th className="text-right px-3 py-2 font-semibold text-amber-700">Prestacional</th>
-                        <th className="text-right px-3 py-2 font-semibold text-rose-700">Pago Broker</th>
-                        {ivaBrokerEnabled && <th className="text-right px-3 py-2 font-semibold text-orange-700">└ IVA</th>}
+                        <th className="text-right px-3 py-2 font-semibold text-rose-700">Pago Broker{ivaBrokerEnabled ? " (neto)" : ""}</th>
+                        {ivaBrokerEnabled && <th className="text-right px-3 py-2 font-semibold text-orange-700">IVA broker</th>}
                         <th className="text-right px-3 py-2 font-semibold text-violet-700">Marketing</th>
                         <th className="text-right px-3 py-2 font-semibold text-violet-700">Cuotas Préstamos</th>
                         {cupoChequesPropios > 0 && <th className="text-right px-3 py-2 font-semibold text-indigo-700">Int. cheques</th>}
@@ -1599,8 +1611,8 @@ function SimuladorCAC() {
                       </tr>
                     </thead>
                     <tbody>
-                      {simulacion.data.map((row, idx) => {
-                        const totalEgresos = row.costoPrestacional + row.pagoBroker + row.cuotasPrestamos + row.marketing + (row.interesCheques || 0);
+                      {filasCashflow.map((row, idx) => {
+                        const totalEgresos = row._totalEgresos;
                         const isAguinaldo = row.mes % 6 === 1;
                         return (
                           <tr key={row.mes} className={`border-b border-slate-100 ${idx % 2 === 0 ? "bg-white" : "bg-slate-50/50"} ${isAguinaldo && aguinaldoEnabled ? "ring-1 ring-fuchsia-100" : ""} hover:bg-amber-50`}>
@@ -1614,19 +1626,19 @@ function SimuladorCAC() {
                             <td className="px-3 py-2 text-right font-mono">{row.financiacionOS > 0 ? `$${row.financiacionOS.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className="px-3 py-2 text-right font-mono font-bold text-emerald-900 bg-emerald-50">${row.ingresos.toLocaleString("es-AR")}M</td>
                             <td className="px-3 py-2 text-right font-mono text-amber-700">{row.costoPrestacional > 0 ? `-$${row.costoPrestacional.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
-                            <td className="px-3 py-2 text-right font-mono text-rose-700">{row.pagoBroker > 0 ? `-$${row.pagoBroker.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
+                            <td className="px-3 py-2 text-right font-mono text-rose-700">{row.pagoBrokerNeto > 0 ? `-$${row.pagoBrokerNeto.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             {ivaBrokerEnabled && <td className="px-3 py-2 text-right font-mono text-orange-700">{row.ivaBroker > 0 ? `-$${row.ivaBroker.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>}
                             <td className="px-3 py-2 text-right font-mono text-violet-700">{row.marketing > 0 ? `-$${row.marketing.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className="px-3 py-2 text-right font-mono text-violet-700">{row.cuotasPrestamos > 0 ? `-$${row.cuotasPrestamos.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             {cupoChequesPropios > 0 && <td className="px-3 py-2 text-right font-mono text-indigo-700">{row.interesCheques > 0 ? `-$${row.interesCheques.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>}
                             <td className="px-3 py-2 text-right font-mono font-bold text-rose-900 bg-rose-50">-${totalEgresos.toLocaleString("es-AR")}M</td>
-                            <td className={`px-3 py-2 text-right font-mono font-bold bg-slate-100 ${row.flujoOperativo >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.flujoOperativo >= 0 ? "+" : ""}${row.flujoOperativo.toLocaleString("es-AR")}M</td>
+                            <td className={`px-3 py-2 text-right font-mono font-bold bg-slate-100 ${row._flujoOpRec >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row._flujoOpRec >= 0 ? "+" : ""}${row._flujoOpRec.toLocaleString("es-AR")}M</td>
                             <td className="px-3 py-2 text-right font-mono text-violet-700">{row.nuevoPrestamo > 0 ? `+$${row.nuevoPrestamo.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className="px-3 py-2 text-right font-mono text-emerald-700">{row.precancelacion > 0 ? `-$${row.precancelacion.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className="px-3 py-2 text-right font-mono text-rose-700">{row.retiro > 0 ? `-$${row.retiro.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className="px-3 py-2 text-right font-mono text-cyan-700">{row.saldoCaja > 0 ? `$${row.saldoCaja.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             <td className={`px-3 py-2 text-right font-mono ${row.flujoNeto >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.flujoNeto >= 0 ? "+" : ""}${row.flujoNeto.toLocaleString("es-AR")}M</td>
-                            <td className={`px-3 py-2 text-right font-mono font-bold bg-indigo-50 ${row.acumuladoOperativo >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row.acumuladoOperativo >= 0 ? "+" : ""}${row.acumuladoOperativo.toLocaleString("es-AR")}M</td>
+                            <td className={`px-3 py-2 text-right font-mono font-bold bg-indigo-50 ${row._acumOpRec >= 0 ? "text-emerald-700" : "text-rose-700"}`}>{row._acumOpRec >= 0 ? "+" : ""}${row._acumOpRec.toLocaleString("es-AR")}M</td>
                             <td className="px-3 py-2 text-right font-mono text-rose-700">{row.deudaVigente > 0 ? `$${row.deudaVigente.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>
                             {cupoChequesPropios > 0 && <td className="px-3 py-2 text-right font-mono font-bold text-indigo-700 bg-indigo-50/60">{row.chequesAbiertos > 0 ? `$${row.chequesAbiertos.toLocaleString("es-AR")}M` : <span className="text-slate-400">—</span>}</td>}
                           </tr>
